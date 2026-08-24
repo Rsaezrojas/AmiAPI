@@ -1,57 +1,16 @@
-# AmiAPI
+# AmiAPI M1.1 fix / 0.1.2
 
-A small C foundation for accessing modern Internet APIs from classic AmigaOS.
+Targeted crash fix for classic AmigaOS.
 
-## Baseline
+The key change is moving the 4096-byte receive buffer out of `AmiAPI_Get()`'s
+stack frame and onto the heap. Classic AmigaDOS processes can have very small
+stacks, so the previous local `unsigned char chunk[4096]` could overflow the
+process stack before the network call and later surface as Exec memory-list
+corruption/Gurus.
 
-- AmigaOS 3.x
-- Motorola 68020+
-- No FPU or MMU requirement
-- `bsdsocket.library` compatible TCP/IP stack
-- Static library first
-- AmiSSL planned for HTTPS
+Also included: hardened dynamic-buffer accounting with an explicit NUL-byte
+capacity invariant, cleaned diagnostic code, private bsdsocket base, and normal
+response/context cleanup restored.
 
-## M1.1
-
-M1.1 adds an AmigaOS transport backend alongside the already tested POSIX
-backend. HTTP remains platform-independent.
-
-### Host build
-
-```sh
-make clean
-make PLATFORM=posix
-make PLATFORM=posix test
-```
-
-### Amiga cross-build
-
-A working AmigaOS cross toolchain and NDK/networking headers are required.
-
-Typical shape:
-
-```sh
-make clean
-make PLATFORM=amiga \
-  CC=m68k-amigaos-gcc \
-  AR=m68k-amigaos-ar \
-  CFLAGS="-O2 -m68020 -Wall -Wextra"
-```
-
-Toolchain naming and include/library paths vary. M1.1 deliberately does not
-pretend that a particular cross toolchain is already qualified.
-
-The Amiga backend opens `bsdsocket.library` version 4 and uses its classic
-socket API. This is intended for stacks such as Roadshow, Miami/MiamiDx and
-Genesis/AmiTCP that provide the compatible interface.
-
-## Current HTTP limitations
-
-- plain `http://` only
-- no redirects
-- no chunked transfer decoding
-- no streaming callbacks
-- response body buffered with a configurable size limit
-
-HTTPS/AmiSSL is the next major layer after the Amiga TCP backend is built and
-run on the target.
+Chunked transfer decoding is not implemented yet; chunked bodies are returned
+raw in this milestone.

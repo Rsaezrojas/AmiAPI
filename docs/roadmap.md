@@ -1,32 +1,20 @@
 # AmiAPI Roadmap
 
-## M0 - Foundation — complete
+## M1.1 target hardening
+- 68020 AmigaOS cross-build
+- bsdsocket transport
+- heap-backed receive buffer for small Amiga process stacks
+- hardened bounded-buffer accounting
+- final acceptance: hello + httpget return without Guru on FS-UAE/AmiTCP_NG
 
-## M1 - TCP + HTTP — complete on POSIX
+## M1.2 HTTP correctness
+- chunked transfer decoding
+- Content-Length validation
+- redirects
 
-## M1.1 - AmigaOS transport — implementation complete, target qualification pending
-- platform-selectable transport backend
-- bsdsocket.library v4 open/close
-- IPv4 DNS via gethostbyname
-- TCP connect/send/receive/close
-- unchanged platform-independent HTTP layer
-- next acceptance gate: cross-build and run `httpget` on AmigaOS
-
-## M2 - HTTPS / AmiSSL
-Only begin target integration after M1.1 has been built and exercised on the
-Amiga target.
-
-## M3 - Streaming HTTP
-Callbacks, download-to-file, redirects, chunked transfer decoding, cancellation.
-
-## M4 - JSON
-Small-footprint parsing and UTF-8 policy.
-
-## M5 - Open-Meteo
-First complete modern HTTPS+JSON API example.
-
-## M6 - SDK preview
-Documentation, cross-build qualification and Aminet-style packaging.
-
-## M7 - SampleScout
-Freesound provider and first substantial AmiAPI application.
+## M2 HTTPS / AmiSSL
+## M3 streaming/download-to-file
+## M4 JSON
+## M5 Open-Meteo
+## M6 SDK preview
+## M7 SampleScout
