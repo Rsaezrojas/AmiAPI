@@ -5,41 +5,51 @@ A small C foundation for accessing modern Internet APIs from classic AmigaOS.
 ## Baseline
 
 - AmigaOS 3.x
-- Motorola 68020 or newer
-- No FPU requirement
-- No MMU requirement
-- Static library first; shared-library ABI comes later
-- C89-friendly implementation style
+- Motorola 68020+
+- No FPU or MMU requirement
+- Static library first
+- Bounded-memory design
+- AmiSSL planned for HTTPS
 
-M0 deliberately contains no networking, TLS, or JSON support. It establishes a
-small buildable API and repository structure before those layers are added.
+## M1 status
 
-## Build on a development host
+M1 introduces the first HTTP/1.1 client and a transport boundary.
+
+The current transport implementation is POSIX and is used for development and
+integration testing on the host. The AmigaOS `bsdsocket.library` backend is the
+next platform backend to qualify.
+
+Supported in this milestone:
+
+- `http://` URLs
+- DNS lookup
+- TCP connect/send/receive
+- HTTP/1.1 GET
+- status parsing
+- response headers
+- case-insensitive header lookup
+- bounded response bodies
+- deterministic local integration test
+
+Not supported yet:
+
+- HTTPS/TLS
+- redirects
+- chunked transfer decoding
+- keep-alive reuse
+- IPv6 literals in URLs
+- streaming response callbacks
+
+## Build and test
 
 ```sh
+make clean
 make
-./build/hello
+make test
 ```
 
-Clean with:
+Try against a plain HTTP endpoint:
 
 ```sh
-make clean
+./build/httpget http://example.com/
 ```
-
-## Cross compilation
-
-The Makefile is intentionally simple. Override the compiler and archiver when a
-working Amiga cross toolchain is available, for example:
-
-```sh
-make clean
-make CC=m68k-amigaos-gcc AR=m68k-amigaos-ar \
-     CFLAGS="-O2 -m68020 -Wall -Wextra -Iinclude"
-```
-
-Exact cross-toolchain flags will be qualified in a later milestone.
-
-## Project status
-
-M0: repository/build foundation.

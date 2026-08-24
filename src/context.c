@@ -1,12 +1,6 @@
 #include <stdlib.h>
-
 #include <amiapi/amiapi.h>
-
-struct AmiAPIContext {
-    unsigned long magic;
-};
-
-#define AMIAPI_CONTEXT_MAGIC 0x41415049UL
+#include "internal.h"
 
 struct AmiAPIContext *AmiAPI_Create(void)
 {
@@ -17,6 +11,8 @@ struct AmiAPIContext *AmiAPI_Create(void)
         return NULL;
 
     ctx->magic = AMIAPI_CONTEXT_MAGIC;
+    ctx->max_body = (size_t)AMIAPI_DEFAULT_MAX_BODY;
+    ctx->last_error = AMIAPI_OK;
     return ctx;
 }
 
@@ -31,5 +27,25 @@ void AmiAPI_Destroy(struct AmiAPIContext *ctx)
 
 const char *AmiAPI_VersionString(void)
 {
-    return "0.0.1";
+    return "0.1.0";
+}
+
+void AmiAPI_SetMaxBody(struct AmiAPIContext *ctx, size_t max_body)
+{
+    if (ctx == NULL || ctx->magic != AMIAPI_CONTEXT_MAGIC)
+        return;
+    ctx->max_body = max_body;
+}
+
+enum AmiAPIError AmiAPI_LastError(const struct AmiAPIContext *ctx)
+{
+    if (ctx == NULL || ctx->magic != AMIAPI_CONTEXT_MAGIC)
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+    return ctx->last_error;
+}
+
+void amiapi_set_error(struct AmiAPIContext *ctx, enum AmiAPIError error)
+{
+    if (ctx != NULL && ctx->magic == AMIAPI_CONTEXT_MAGIC)
+        ctx->last_error = error;
 }

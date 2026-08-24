@@ -3,15 +3,18 @@
 const char *AmiAPI_ErrorString(enum AmiAPIError error)
 {
     switch (error) {
-    case AMIAPI_OK:
-        return "success";
-    case AMIAPI_ERR_INVALID_ARGUMENT:
-        return "invalid argument";
-    case AMIAPI_ERR_NO_MEMORY:
-        return "out of memory";
-    case AMIAPI_ERR_INTERNAL:
-        return "internal error";
-    default:
-        return "unknown error";
+    case AMIAPI_OK: return "success";
+    case AMIAPI_ERR_INVALID_ARGUMENT: return "invalid argument";
+    case AMIAPI_ERR_NO_MEMORY: return "out of memory";
+    case AMIAPI_ERR_INTERNAL: return "internal error";
+    case AMIAPI_ERR_BAD_URL: return "bad URL";
+    case AMIAPI_ERR_UNSUPPORTED_SCHEME: return "unsupported URL scheme";
+    case AMIAPI_ERR_DNS: return "DNS lookup failed";
+    case AMIAPI_ERR_CONNECT: return "connection failed";
+    case AMIAPI_ERR_SEND: return "send failed";
+    case AMIAPI_ERR_RECEIVE: return "receive failed";
+    case AMIAPI_ERR_PROTOCOL: return "HTTP protocol error";
+    case AMIAPI_ERR_RESPONSE_TOO_LARGE: return "HTTP response body too large";
+    default: return "unknown error";
     }
 }

@@ -3,36 +3,41 @@ AR ?= ar
 CFLAGS ?= -O2 -Wall -Wextra -pedantic
 CPPFLAGS ?= -Iinclude
 ARFLAGS ?= rcs
+PYTHON ?= python3
 
 BUILD := build
 LIB := $(BUILD)/libamiapi.a
-EXAMPLE := $(BUILD)/hello
+HELLO := $(BUILD)/hello
+HTTPGET := $(BUILD)/httpget
 
 LIB_OBJS := \
 	$(BUILD)/context.o \
-	$(BUILD)/errors.o
+	$(BUILD)/errors.o \
+	$(BUILD)/http.o \
+	$(BUILD)/transport_posix.o
 
 .PHONY: all clean test
 
-all: $(LIB) $(EXAMPLE)
+all: $(LIB) $(HELLO) $(HTTPGET)
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/context.o: src/context.c include/amiapi/amiapi.h include/amiapi/errors.h | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(BUILD)/errors.o: src/errors.c include/amiapi/errors.h | $(BUILD)
+$(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(LIB): $(LIB_OBJS)
 	$(AR) $(ARFLAGS) $@ $^
 
-$(EXAMPLE): examples/hello.c $(LIB) include/amiapi/amiapi.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) examples/hello.c $(LIB) -o $@
+$(HELLO): examples/hello.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) -o $@
+
+$(HTTPGET): examples/httpget.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) -o $@
 
 test: all
-	$(EXAMPLE)
+	$(HELLO)
+	$(PYTHON) tests/test_http.py
 
 clean:
 	rm -rf $(BUILD)

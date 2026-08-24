@@ -1,47 +1,32 @@
 # AmiAPI Architecture
 
-## Purpose
+## Baseline
 
-AmiAPI provides a small reusable C layer for native Amiga applications that
-need to consume modern Internet APIs without embedding a web browser.
+AmiAPI targets AmigaOS 3.x on 68020+ with no FPU or MMU requirement. A stock
+A1200 with Fast RAM is the reference performance class.
 
-## Initial target
+## Design
 
-The native baseline is:
-
-- AmigaOS 3.x
-- 68020+
-- no required FPU
-- no required MMU
-- TCP/IP through a bsdsocket.library-compatible stack
-- TLS through AmiSSL once HTTPS support is implemented
-
-A stock A1200 with Fast RAM is the reference performance class.
-
-## Design principles
-
-1. Keep memory use bounded.
-2. Prefer streaming over whole-response buffering.
-3. Avoid mandatory large runtime dependencies.
-4. Keep service-specific code outside the core.
-5. Keep the public API small and C-friendly.
-6. Do not freeze a shared-library ABI prematurely.
-7. Make errors explicit and diagnosable.
-8. Keep a future lightweight 68000/bridge transport possible without making it
-   part of the v0.1 baseline.
-
-## Layering
-
-Future layers are expected to look approximately like:
+Applications use the public AmiAPI interface. Protocol code does not call
+platform socket APIs directly; it goes through a small transport boundary.
 
     Application
         |
     AmiAPI public API
         |
-    HTTP / URL / JSON / authentication helpers
+    HTTP
         |
-    TLS abstraction
+    transport boundary
+       / \
+  POSIX   AmigaOS (bsdsocket.library; next)
         |
-    bsdsocket.library-compatible networking
+       TCP
 
-M0 implements only context lifecycle, errors, versioning, and the static build.
+HTTPS will add a TLS transport without requiring HTTP users to understand TLS.
+
+M1 intentionally buffers the response body but enforces a configurable upper
+bound (1 MiB by default). M3 replaces this as the primary model with streaming
+callbacks/download-to-file while retaining a convenient bounded-buffer API.
+
+The static library remains the development format until the API has enough
+real-world use to justify freezing a shared-library ABI.

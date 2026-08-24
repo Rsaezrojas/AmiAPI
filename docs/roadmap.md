@@ -1,60 +1,45 @@
 # AmiAPI Roadmap
 
-## M0 - Foundation
+## M0 - Foundation — complete
+Static library, opaque context, errors, version API, host build.
 
-- Repository structure
-- Static C library
-- Opaque context
-- Error namespace
-- Version API
-- Minimal example
-- Host build
-
-## M1 - TCP and HTTP
-
-- bsdsocket-compatible transport abstraction
-- HTTP GET
-- response status and headers
-- bounded reads and explicit limits
-- host-side test transport where practical
+## M1 - TCP + HTTP — host implementation
+- transport boundary
+- POSIX backend
+- HTTP/1.1 GET
+- status and headers
+- bounded body
+- local integration test
+- next: qualify `bsdsocket.library` backend on AmigaOS
 
 ## M2 - HTTPS
-
-- AmiSSL integration
+- AmiSSL transport
 - certificate verification
 - TLS error mapping
-- HTTPS GET
 
 ## M3 - Streaming HTTP
-
-- response streaming callbacks
-- download-to-file support
+- response callbacks
+- download-to-file
 - redirects
-- size limits and cancellation
+- chunked transfer decoding
+- cancellation and explicit limits
 
 ## M4 - JSON
-
 - small-footprint parser
-- streaming/event-oriented operation where practical
-- UTF-8 handling policy
+- event/streaming-oriented use
+- UTF-8 policy
 
-## M5 - First real API
-
-- Open-Meteo example
-- query/URL encoding
-- real HTTPS + JSON demonstration
+## M5 - Open-Meteo
+- URL/query encoding
+- real HTTPS + JSON example
 
 ## M6 - SDK preview
-
-- API cleanup
-- documentation
-- examples
-- cross-build qualification on AmigaOS
-- initial Aminet-style package layout
+- API cleanup and docs
+- AmigaOS cross-build qualification
+- Aminet-style packaging
 
 ## M7 - SampleScout foundation
-
-- Freesound provider built on AmiAPI
-- search and metadata
-- preview/download plumbing
-- authentication according to Freesound's approved client model
+- Freesound provider
+- search/metadata
+- preview/download
+- approved authentication model
