@@ -29,4 +29,7 @@ long amiapi_transport_receive(struct AmiAPITransport *transport,
                               size_t size);
 void amiapi_transport_close(struct AmiAPITransport *transport);
 
+/* Release process-global resources owned by the selected platform backend. */
+void amiapi_transport_platform_cleanup(void);
+
 #endif

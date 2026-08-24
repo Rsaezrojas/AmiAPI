@@ -2,7 +2,6 @@
 #define AMIAPI_AMIAPI_H
 
 #include <stddef.h>
-
 #include <amiapi/errors.h>
 
 #ifdef __cplusplus
@@ -11,7 +10,7 @@ extern "C" {
 
 #define AMIAPI_VERSION_MAJOR 0
 #define AMIAPI_VERSION_MINOR 1
-#define AMIAPI_VERSION_PATCH 0
+#define AMIAPI_VERSION_PATCH 1
 
 #define AMIAPI_DEFAULT_MAX_BODY (1024UL * 1024UL)
 

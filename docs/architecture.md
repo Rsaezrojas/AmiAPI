@@ -1,32 +1,45 @@
 # AmiAPI Architecture
 
-## Baseline
+## Native baseline
 
-AmiAPI targets AmigaOS 3.x on 68020+ with no FPU or MMU requirement. A stock
-A1200 with Fast RAM is the reference performance class.
+- AmigaOS 3.x
+- 68020+
+- no FPU
+- no MMU
+- bsdsocket.library-compatible networking
 
-## Design
+A stock A1200 with Fast RAM is the reference performance class.
 
-Applications use the public AmiAPI interface. Protocol code does not call
-platform socket APIs directly; it goes through a small transport boundary.
+## Transport boundary
+
+HTTP is independent of the operating-system socket API:
 
     Application
         |
-    AmiAPI public API
+      AmiAPI
         |
-    HTTP
+       HTTP
         |
-    transport boundary
-       / \
-  POSIX   AmigaOS (bsdsocket.library; next)
-        |
-       TCP
+  transport interface
+     /         \
+ POSIX       AmigaOS
+ sockets    bsdsocket.library
 
-HTTPS will add a TLS transport without requiring HTTP users to understand TLS.
+M1.1 provides both backends. The POSIX backend remains valuable for rapid
+development and deterministic host-side tests. The Amiga backend is selected
+with `PLATFORM=amiga`.
 
-M1 intentionally buffers the response body but enforces a configurable upper
-bound (1 MiB by default). M3 replaces this as the primary model with streaming
-callbacks/download-to-file while retaining a convenient bounded-buffer API.
+The TLS milestone will extend this boundary rather than putting AmiSSL calls
+throughout HTTP code.
 
-The static library remains the development format until the API has enough
-real-world use to justify freezing a shared-library ABI.
+## Resource ownership
+
+The Amiga backend owns its `bsdsocket.library` handle. M1.1 performs platform
+cleanup when an AmiAPI context is destroyed. Multiple simultaneous contexts
+are not yet a supported/qualified use case; resource lifetime will be refined
+before the public ABI is frozen.
+
+## Memory
+
+HTTP currently buffers response bodies but enforces a default 1 MiB bound.
+Streaming/download-to-file becomes the preferred mechanism in M3.

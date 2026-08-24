@@ -15,6 +15,7 @@ const char *AmiAPI_ErrorString(enum AmiAPIError error)
     case AMIAPI_ERR_RECEIVE: return "receive failed";
     case AMIAPI_ERR_PROTOCOL: return "HTTP protocol error";
     case AMIAPI_ERR_RESPONSE_TOO_LARGE: return "HTTP response body too large";
+    case AMIAPI_ERR_SOCKET_LIBRARY: return "unable to open bsdsocket.library";
     default: return "unknown error";
     }
 }

@@ -7,49 +7,51 @@ A small C foundation for accessing modern Internet APIs from classic AmigaOS.
 - AmigaOS 3.x
 - Motorola 68020+
 - No FPU or MMU requirement
+- `bsdsocket.library` compatible TCP/IP stack
 - Static library first
-- Bounded-memory design
 - AmiSSL planned for HTTPS
 
-## M1 status
+## M1.1
 
-M1 introduces the first HTTP/1.1 client and a transport boundary.
+M1.1 adds an AmigaOS transport backend alongside the already tested POSIX
+backend. HTTP remains platform-independent.
 
-The current transport implementation is POSIX and is used for development and
-integration testing on the host. The AmigaOS `bsdsocket.library` backend is the
-next platform backend to qualify.
-
-Supported in this milestone:
-
-- `http://` URLs
-- DNS lookup
-- TCP connect/send/receive
-- HTTP/1.1 GET
-- status parsing
-- response headers
-- case-insensitive header lookup
-- bounded response bodies
-- deterministic local integration test
-
-Not supported yet:
-
-- HTTPS/TLS
-- redirects
-- chunked transfer decoding
-- keep-alive reuse
-- IPv6 literals in URLs
-- streaming response callbacks
-
-## Build and test
+### Host build
 
 ```sh
 make clean
-make
-make test
+make PLATFORM=posix
+make PLATFORM=posix test
 ```
 
-Try against a plain HTTP endpoint:
+### Amiga cross-build
+
+A working AmigaOS cross toolchain and NDK/networking headers are required.
+
+Typical shape:
 
 ```sh
-./build/httpget http://example.com/
+make clean
+make PLATFORM=amiga \
+  CC=m68k-amigaos-gcc \
+  AR=m68k-amigaos-ar \
+  CFLAGS="-O2 -m68020 -Wall -Wextra"
 ```
+
+Toolchain naming and include/library paths vary. M1.1 deliberately does not
+pretend that a particular cross toolchain is already qualified.
+
+The Amiga backend opens `bsdsocket.library` version 4 and uses its classic
+socket API. This is intended for stacks such as Roadshow, Miami/MiamiDx and
+Genesis/AmiTCP that provide the compatible interface.
+
+## Current HTTP limitations
+
+- plain `http://` only
+- no redirects
+- no chunked transfer decoding
+- no streaming callbacks
+- response body buffered with a configurable size limit
+
+HTTPS/AmiSSL is the next major layer after the Amiga TCP backend is built and
+run on the target.

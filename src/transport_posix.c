@@ -102,3 +102,7 @@ void amiapi_transport_close(struct AmiAPITransport *transport)
         transport->fd = -1;
     }
 }
+
+void amiapi_transport_platform_cleanup(void)
+{
+}
