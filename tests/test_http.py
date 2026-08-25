@@ -1534,7 +1534,176 @@ def test_form_request_helper():
     print("Form request helper test: OK")
 
 
+class BearerAuthHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def do_GET(self):
+        type(self).seen.append(
+            self.headers.get("Authorization")
+        )
+
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class BearerRedirectHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    target_port = None
+
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header(
+            "Location",
+            f"http://127.0.0.1:{type(self).target_port}/final",
+        )
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_bearer_auth_helper():
+    BearerAuthHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), BearerAuthHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            result = subprocess.run(
+                [
+                    "./build/authget",
+                    f"http://127.0.0.1:{port}/auth",
+                    "secret-token",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "Bearer auth helper failed\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert BearerAuthHandler.seen == [
+        "Bearer secret-token"
+    ], BearerAuthHandler.seen
+
+    print("Bearer auth helper test: OK")
+
+
+def test_bearer_auth_invalid_tokens():
+    cases = [
+        "",
+        "good\r\nInjected: bad",
+        "good\nInjected: bad",
+    ]
+
+    for token in cases:
+        result = subprocess.run(
+            [
+                "./build/authget",
+                "http://127.0.0.1:1/",
+                token,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+
+        if result.returncode != 5:
+            raise AssertionError(
+                "invalid Bearer token was not rejected\n"
+                f"token={token!r}\n"
+                f"exit={result.returncode}\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+    print("Bearer auth validation tests: OK")
+
+
+def test_bearer_auth_cross_origin_redirect():
+    BearerAuthHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), BearerAuthHandler) as target:
+        target_port = target.server_address[1]
+
+        target_thread = threading.Thread(
+            target=target.serve_forever,
+            daemon=True,
+        )
+        target_thread.start()
+
+        BearerRedirectHandler.target_port = target_port
+
+        with TestServer(
+            ("127.0.0.1", 0),
+            BearerRedirectHandler,
+        ) as source:
+            source_port = source.server_address[1]
+
+            source_thread = threading.Thread(
+                target=source.serve_forever,
+                daemon=True,
+            )
+            source_thread.start()
+
+            try:
+                result = subprocess.run(
+                    [
+                        "./build/authget",
+                        f"http://127.0.0.1:{source_port}/start",
+                        "secret-token",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                )
+            finally:
+                source.shutdown()
+                source_thread.join()
+
+        target.shutdown()
+        target_thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "Bearer redirect test failed\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert BearerAuthHandler.seen == [None], BearerAuthHandler.seen
+
+    print("Bearer cross-origin redirect test: OK")
+
+
 def main():
+    test_bearer_auth_helper()
+    test_bearer_auth_invalid_tokens()
+    test_bearer_auth_cross_origin_redirect()
     test_form_request_helper()
     test_json_http_integration()
     test_json_request_helper()

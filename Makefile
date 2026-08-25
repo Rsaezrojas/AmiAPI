@@ -28,6 +28,7 @@ JSONSEND := $(BUILD)/jsonsend
 TEST_URL := $(BUILD)/test_url
 TEST_FORM := $(BUILD)/test_form
 FORMSEND := $(BUILD)/formsend
+AUTHGET := $(BUILD)/authget
 
 ifeq ($(PLATFORM),posix)
 TRANSPORT_SRC := src/transport_posix.c
@@ -48,6 +49,7 @@ LIB_OBJS := \
 	$(BUILD)/json_http.o \
 	$(BUILD)/url.o \
 	$(BUILD)/form.o \
+	$(BUILD)/auth.o \
 	$(TRANSPORT_OBJ)
 
 .PHONY: all clean test print-config
@@ -76,6 +78,9 @@ $(BUILD)/url.o: src/url.c include/amiapi/url.h include/amiapi/errors.h | $(BUILD
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/form.o: src/form.c include/amiapi/form.h include/amiapi/amiapi.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/auth.o: src/auth.c include/amiapi/auth.h include/amiapi/amiapi.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(TRANSPORT_OBJ): $(TRANSPORT_SRC) src/internal.h | $(BUILD)
@@ -114,9 +119,12 @@ $(TEST_FORM): tests/test_form.c $(LIB)
 $(FORMSEND): tests/formsend.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+$(AUTHGET): tests/authget.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 test: all
 ifeq ($(PLATFORM),posix)
-	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND)
+	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND) $(AUTHGET)
 	$(HELLO)
 	$(PYTHON) tests/test_http.py
 	$(TEST_JSON)
