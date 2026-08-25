@@ -313,10 +313,173 @@ def test_content_length_framing():
     print("Content-Length framing tests: OK")
 
 
+class ChunkedHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        self.wfile.write(
+            b"4;amiapi=test\r\n"
+            b"Wiki\r\n"
+            b"5\r\n"
+            b"pedia\r\n"
+            b"A\r\n"
+            b"-chunked!!\r\n"
+            b"0\r\n"
+            b"X-AmiAPI-Trailer: yes\r\n"
+            b"\r\n"
+        )
+        self.wfile.flush()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class BadChunkSizeHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        self.wfile.write(
+            b"ZZ\r\n"
+            b"broken\r\n"
+            b"0\r\n\r\n"
+        )
+        self.wfile.flush()
+        self.close_connection = True
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class TruncatedChunkHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        self.wfile.write(
+            b"10\r\n"
+            b"short"
+        )
+        self.wfile.flush()
+        self.close_connection = True
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_chunked_transfer():
+    with TestServer(("127.0.0.1", 0), ChunkedHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            result = run_httpget(
+                f"http://127.0.0.1:{port}/hello"
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "chunked response unexpectedly failed\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    # 4 + 5 + 10 decoded body bytes.
+    assert "HTTP 200" in result.stdout, result.stdout
+    assert "body-bytes: 19" in result.stdout, result.stdout
+
+    run_failure_server(
+        BadChunkSizeHandler,
+        "malformed chunk size",
+    )
+
+    run_failure_server(
+        TruncatedChunkHandler,
+        "truncated chunk",
+    )
+
+    print("Chunked transfer tests: OK")
+
+
+def test_https_chunked():
+    with tempfile.TemporaryDirectory(prefix="amiapi-https-chunked-") as tmp:
+        ca_cert, server_cert, server_key = make_certificates(tmp)
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(
+            certfile=server_cert,
+            keyfile=server_key,
+        )
+
+        with TestServer(("127.0.0.1", 0), ChunkedHandler) as server:
+            server.socket = context.wrap_socket(
+                server.socket,
+                server_side=True,
+            )
+
+            port = server.server_address[1]
+
+            thread = threading.Thread(
+                target=server.serve_forever,
+                daemon=True,
+            )
+            thread.start()
+
+            env = os.environ.copy()
+            env["SSL_CERT_FILE"] = str(ca_cert)
+
+            try:
+                result = run_httpget(
+                    f"https://localhost:{port}/hello",
+                    env=env,
+                )
+            finally:
+                server.shutdown()
+                thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "HTTPS chunked response unexpectedly failed\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert "HTTP 200" in result.stdout, result.stdout
+    assert "body-bytes: 19" in result.stdout, result.stdout
+
+    print("HTTPS chunked transfer test: OK")
+
+
 def main():
     test_http()
     test_https()
     test_content_length_framing()
+    test_chunked_transfer()
+    test_https_chunked()
 
 
 if __name__ == "__main__":
