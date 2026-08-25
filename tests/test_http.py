@@ -1271,7 +1271,195 @@ def test_method_redirect_semantics():
     print("Request method redirect tests: OK")
 
 
+class JSONHTTPHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        cases = {
+            "/json": (
+                "application/json",
+                b'{"name":"AmiAPI"}',
+            ),
+            "/json-charset": (
+                "application/json; charset=utf-8",
+                b'{"name":"AmiAPI"}',
+            ),
+            "/problem": (
+                "application/problem+json",
+                b'{"name":"AmiAPI"}',
+            ),
+            "/vendor": (
+                "application/vnd.example+json",
+                b'{"name":"AmiAPI"}',
+            ),
+            "/plain-json": (
+                "text/plain",
+                b'{"name":"AmiAPI"}',
+            ),
+            "/bad-json-type": (
+                "application/jsonp",
+                b'{"name":"AmiAPI"}',
+            ),
+            "/invalid-json": (
+                "application/json",
+                b'{"name":',
+            ),
+        }
+
+        if self.path not in cases:
+            self.send_error(404)
+            return
+
+        content_type, body = cases[self.path]
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_json_http_integration():
+    with TestServer(("127.0.0.1", 0), JSONHTTPHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            cases = [
+                ("/json", True, True),
+                ("/json-charset", True, True),
+                ("/problem", True, True),
+                ("/vendor", True, True),
+                ("/plain-json", False, True),
+                ("/bad-json-type", False, True),
+                ("/invalid-json", True, False),
+            ]
+
+            for path, expected_is_json, expected_parse in cases:
+                result = subprocess.run(
+                    [
+                        "./build/jsonhttp",
+                        f"http://127.0.0.1:{port}{path}",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                )
+
+                if expected_parse:
+                    if result.returncode != 0:
+                        raise AssertionError(
+                            f"JSON HTTP case failed for {path}\n"
+                            f"exit={result.returncode}\n"
+                            f"stdout:\n{result.stdout}\n"
+                            f"stderr:\n{result.stderr}"
+                        )
+
+                    expected_line = (
+                        "is-json: 1"
+                        if expected_is_json
+                        else "is-json: 0"
+                    )
+
+                    assert expected_line in result.stdout, result.stdout
+                    assert "name: AmiAPI" in result.stdout, result.stdout
+                else:
+                    if result.returncode != 21:
+                        raise AssertionError(
+                            f"invalid JSON unexpectedly parsed for {path}\n"
+                            f"exit={result.returncode}\n"
+                            f"stdout:\n{result.stdout}\n"
+                            f"stderr:\n{result.stderr}"
+                        )
+
+        finally:
+            server.shutdown()
+            thread.join()
+
+    print("JSON/HTTP integration tests: OK")
+
+
+class JSONRequestHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def do_POST(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(size)
+
+        type(self).seen.append({
+            "content_type": self.headers.get("Content-Type"),
+            "accept": self.headers.get("Accept"),
+            "body": body,
+        })
+
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_json_request_helper():
+    JSONRequestHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), JSONRequestHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            result = subprocess.run(
+                [
+                    "./build/jsonsend",
+                    f"http://127.0.0.1:{port}/json",
+                    '{"name":"AmiAPI","ok":true}',
+                ],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "JSON request helper failed\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert len(JSONRequestHandler.seen) == 1
+
+    seen = JSONRequestHandler.seen[0]
+
+    assert seen["content_type"] == "application/json", seen
+    assert seen["accept"] == "*/*", seen
+    assert seen["body"] == b'{"name":"AmiAPI","ok":true}', seen
+
+    print("JSON request helper test: OK")
+
+
 def main():
+    test_json_http_integration()
+    test_json_request_helper()
     test_request_headers()
     test_method_redirect_semantics()
     test_request_methods_and_bodies()
