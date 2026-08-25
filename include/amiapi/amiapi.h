@@ -29,6 +29,11 @@ enum AmiAPIError AmiAPI_RequestSetHeader(
     const char *,
     const char *
 );
+enum AmiAPIError AmiAPI_RequestSetBody(
+    struct AmiAPIRequest *,
+    const void *,
+    size_t
+);
 void AmiAPI_RequestClearHeaders(struct AmiAPIRequest *);
 struct AmiAPIResponse *AmiAPI_RequestExecute(struct AmiAPIRequest *);
 void AmiAPI_RequestDestroy(struct AmiAPIRequest *);

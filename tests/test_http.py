@@ -1010,8 +1010,272 @@ def test_sensitive_header_cross_origin_redirect():
     print("Cross-origin sensitive-header stripping test: OK")
 
 
+class MethodBodyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def record(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(size)
+
+        type(self).seen.append({
+            "method": self.command,
+            "length": size,
+            "body": body,
+        })
+
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def do_POST(self):
+        self.record()
+
+    def do_PUT(self):
+        self.record()
+
+    def do_PATCH(self):
+        self.record()
+
+    def do_DELETE(self):
+        self.record()
+
+    def do_HEAD(self):
+        type(self).seen.append({
+            "method": self.command,
+            "length": int(self.headers.get("Content-Length", "0")),
+            "body": b"",
+        })
+
+        self.send_response(200)
+        self.send_header("Content-Length", "123")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def run_method_request(method, url, body_hex):
+    return subprocess.run(
+        [
+            "./build/requestsend",
+            method,
+            url,
+            body_hex,
+        ],
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+
+
+def test_request_methods_and_bodies():
+    MethodBodyHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), MethodBodyHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            cases = [
+                ("POST", "7b226f6b223a747275657d"),  # {"ok":true}
+                ("PUT", "0001ff80"),
+                ("PATCH", "41424300ff"),
+                ("DELETE", "deadbeef"),
+                ("HEAD", ""),
+            ]
+
+            results = []
+
+            for method, body in cases:
+                results.append(
+                    run_method_request(
+                        method,
+                        f"http://127.0.0.1:{port}/method",
+                        body,
+                    )
+                )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    for result in results:
+        if result.returncode != 0:
+            raise AssertionError(
+                "method/body request failed\n"
+                f"exit={result.returncode}\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+    expected = [
+        ("POST", bytes.fromhex("7b226f6b223a747275657d")),
+        ("PUT", bytes.fromhex("0001ff80")),
+        ("PATCH", bytes.fromhex("41424300ff")),
+        ("DELETE", bytes.fromhex("deadbeef")),
+        ("HEAD", b""),
+    ]
+
+    assert len(MethodBodyHandler.seen) == len(expected)
+
+    for seen, (method, body) in zip(
+        MethodBodyHandler.seen,
+        expected,
+    ):
+        assert seen["method"] == method, seen
+        assert seen["body"] == body, seen
+
+        if method == "HEAD":
+            assert seen["length"] == 0, seen
+        else:
+            assert seen["length"] == len(body), seen
+
+    print("Request method/body tests: OK")
+
+
+def test_get_head_body_rejected():
+    for method in ("GET", "HEAD"):
+        result = run_method_request(
+            method,
+            "http://127.0.0.1:1/",
+            "00ff",
+        )
+
+        if result.returncode != 6:
+            raise AssertionError(
+                f"{method} body was not rejected\n"
+                f"exit={result.returncode}\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+    print("GET/HEAD body rejection tests: OK")
+
+
+class MethodRedirectHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def read_body(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        return self.rfile.read(size)
+
+    def redirect(self, status, location):
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def finish_ok(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def do_POST(self):
+        body = self.read_body()
+
+        type(self).seen.append(
+            (self.path, "POST", body)
+        )
+
+        if self.path == "/303/start":
+            self.redirect(303, "/303/final")
+            return
+
+        if self.path == "/307/start":
+            self.redirect(307, "/307/final")
+            return
+
+        if self.path == "/308/start":
+            self.redirect(308, "/308/final")
+            return
+
+        if self.path in ("/307/final", "/308/final"):
+            self.finish_ok()
+            return
+
+        self.send_error(404)
+
+    def do_GET(self):
+        type(self).seen.append(
+            (self.path, "GET", b"")
+        )
+
+        if self.path == "/303/final":
+            self.finish_ok()
+            return
+
+        self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_method_redirect_semantics():
+    payload = "0001ff80414243"
+    expected_body = bytes.fromhex(payload)
+
+    MethodRedirectHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), MethodRedirectHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            results = []
+
+            for status in ("303", "307", "308"):
+                results.append(
+                    run_method_request(
+                        "POST",
+                        f"http://127.0.0.1:{port}/{status}/start",
+                        payload,
+                    )
+                )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    for result in results:
+        if result.returncode != 0:
+            raise AssertionError(
+                "redirected method request failed\n"
+                f"exit={result.returncode}\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+    assert MethodRedirectHandler.seen == [
+        ("/303/start", "POST", expected_body),
+        ("/303/final", "GET", b""),
+        ("/307/start", "POST", expected_body),
+        ("/307/final", "POST", expected_body),
+        ("/308/start", "POST", expected_body),
+        ("/308/final", "POST", expected_body),
+    ], MethodRedirectHandler.seen
+
+    print("Request method redirect tests: OK")
+
+
 def main():
     test_request_headers()
+    test_method_redirect_semantics()
+    test_request_methods_and_bodies()
+    test_get_head_body_rejected()
     test_sensitive_header_same_origin_redirect()
     test_sensitive_header_cross_origin_redirect()
     test_reserved_headers()

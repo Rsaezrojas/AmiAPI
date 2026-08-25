@@ -23,6 +23,8 @@ struct AmiAPIRequest {
     char *url;
     struct AmiAPIHeader *headers;
     size_t header_count;
+    unsigned char *body;
+    size_t body_size;
 };
 
 struct AmiAPIResponse {
@@ -832,6 +834,18 @@ done:
     return err;
 }
 
+static int request_method_has_entity_body(
+    const char *method)
+{
+    if (!method)
+        return 0;
+
+    return ascii_equal_ci(method, "POST") ||
+           ascii_equal_ci(method, "PUT") ||
+           ascii_equal_ci(method, "PATCH") ||
+           ascii_equal_ci(method, "DELETE");
+}
+
 static int urls_same_origin(
     const char *a_url,
     const char *b_url)
@@ -862,7 +876,10 @@ static int urls_same_origin(
 static struct AmiAPIResponse *amiapi_get_once(
     struct AmiAPIRequest *api_request,
     const char *url,
-    int include_sensitive)
+    int include_sensitive,
+    const char *method,
+    const unsigned char *body,
+    size_t body_size)
 {
     struct AmiAPIContext *ctx;
     struct ParsedURL parsed;
@@ -887,7 +904,9 @@ static struct AmiAPIResponse *amiapi_get_once(
     if (!api_request ||
         !ctx ||
         ctx->magic != AMIAPI_CONTEXT_MAGIC ||
-        !url)
+        !url ||
+        !method ||
+        (!body && body_size != 0))
     {
         amiapi_set_error(ctx, AMIAPI_ERR_INVALID_ARGUMENT); return NULL;
     }
@@ -896,11 +915,11 @@ static struct AmiAPIResponse *amiapi_get_once(
     if (err != AMIAPI_OK) { amiapi_set_error(ctx, err); return NULL; }
 
     request_size =
-        strlen(api_request->method) +
+        strlen(method) +
         strlen(parsed.path) +
         strlen(parsed.host) +
         strlen(AmiAPI_VersionString()) +
-        160;
+        224;
 
     {
         size_t i;
@@ -946,7 +965,7 @@ static struct AmiAPIResponse *amiapi_get_once(
             request_size,
             "%s %s HTTP/1.1\r\n"
             "Host: %s\r\n",
-            api_request->method,
+            method,
             parsed.path,
             parsed.host
         );
@@ -984,6 +1003,15 @@ static struct AmiAPIResponse *amiapi_get_once(
             );
         }
 
+        if (request_method_has_entity_body(method)) {
+            used += (size_t)snprintf(
+                request + used,
+                request_size - used,
+                "Content-Length: %lu\r\n",
+                (unsigned long)body_size
+            );
+        }
+
         snprintf(
             request + used,
             request_size - used,
@@ -1016,6 +1044,21 @@ static struct AmiAPIResponse *amiapi_get_once(
             &transport,
             request,
             strlen(request)
+        );
+    }
+
+    /*
+     * Keep request bodies separate from the textual HTTP header buffer.
+     * This is both binary-safe and avoids duplicating potentially large
+     * payloads in memory on classic Amiga systems.
+     */
+    if (err == AMIAPI_OK &&
+        body_size != 0)
+    {
+        err = amiapi_transport_send_all(
+            &transport,
+            body,
+            body_size
         );
     }
 
@@ -1058,6 +1101,22 @@ static struct AmiAPIResponse *amiapi_get_once(
     err = parse_headers(response, header_copy);
     free(header_copy); header_copy = NULL;
     if (err != AMIAPI_OK) goto fail;
+
+    if (ascii_equal_ci(method, "HEAD")) {
+        /*
+         * RFC semantics: HEAD carries response headers only. A
+         * Content-Length header may describe the GET representation,
+         * but no response body follows.
+         */
+        free(raw);
+        raw = NULL;
+        raw_used = raw_capacity = 0;
+
+        amiapi_transport_close(&transport);
+        free(chunk);
+        amiapi_set_error(ctx, AMIAPI_OK);
+        return response;
+    }
 
     err = transfer_encoding_chunked(
         response,
@@ -1616,9 +1675,17 @@ struct AmiAPIRequest *AmiAPI_RequestCreate(
     }
 
     /*
-     * M2.3.1 deliberately starts with GET only.
+     * Keep the initial method set deliberately small and explicit.
+     * Method names are stored exactly as supplied but matched
+     * case-insensitively here.
      */
-    if (!ascii_equal_ci(method, "GET")) {
+    if (!ascii_equal_ci(method, "GET") &&
+        !ascii_equal_ci(method, "HEAD") &&
+        !ascii_equal_ci(method, "POST") &&
+        !ascii_equal_ci(method, "PUT") &&
+        !ascii_equal_ci(method, "PATCH") &&
+        !ascii_equal_ci(method, "DELETE"))
+    {
         amiapi_set_error(ctx, AMIAPI_ERR_INVALID_ARGUMENT);
         return NULL;
     }
@@ -1721,6 +1788,53 @@ enum AmiAPIError AmiAPI_RequestSetHeader(
     return AMIAPI_OK;
 }
 
+enum AmiAPIError AmiAPI_RequestSetBody(
+    struct AmiAPIRequest *request,
+    const void *data,
+    size_t size)
+{
+    unsigned char *copy;
+
+    if (!request ||
+        !request->ctx ||
+        request->ctx->magic != AMIAPI_CONTEXT_MAGIC ||
+        (!data && size != 0))
+    {
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+    }
+
+    /*
+     * GET and HEAD requests deliberately do not carry entity bodies in
+     * AmiAPI.  This keeps their semantics predictable across servers and
+     * redirects.
+     */
+    if (size != 0 &&
+        (ascii_equal_ci(request->method, "GET") ||
+         ascii_equal_ci(request->method, "HEAD")))
+    {
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+    }
+
+    if (size == 0) {
+        free(request->body);
+        request->body = NULL;
+        request->body_size = 0;
+        return AMIAPI_OK;
+    }
+
+    copy = (unsigned char *)malloc(size);
+    if (!copy)
+        return AMIAPI_ERR_NO_MEMORY;
+
+    memcpy(copy, data, size);
+
+    free(request->body);
+    request->body = copy;
+    request->body_size = size;
+
+    return AMIAPI_OK;
+}
+
 void AmiAPI_RequestClearHeaders(
     struct AmiAPIRequest *request)
 {
@@ -1749,9 +1863,12 @@ void AmiAPI_RequestDestroy(
 
     free(request->method);
     free(request->url);
+    free(request->body);
 
     request->method = NULL;
     request->url = NULL;
+    request->body = NULL;
+    request->body_size = 0;
     request->ctx = NULL;
 
     free(request);
@@ -1766,8 +1883,12 @@ struct AmiAPIResponse *AmiAPI_RequestExecute(
     char *next_url;
     const char *location;
     enum AmiAPIError err;
+    int redirect_status;
     int redirects;
     int include_sensitive;
+    const char *current_method;
+    const unsigned char *current_body;
+    size_t current_body_size;
 
     if (!request ||
         !request->ctx ||
@@ -1790,12 +1911,18 @@ struct AmiAPIResponse *AmiAPI_RequestExecute(
     }
 
     include_sensitive = 1;
+    current_method = request->method;
+    current_body = request->body;
+    current_body_size = request->body_size;
 
     for (redirects = 0; ; ++redirects) {
         response = amiapi_get_once(
             request,
             current_url,
-            include_sensitive
+            include_sensitive,
+            current_method,
+            current_body,
+            current_body_size
         );
 
         if (!response) {
@@ -1826,6 +1953,7 @@ struct AmiAPIResponse *AmiAPI_RequestExecute(
         }
 
         next_url = NULL;
+        redirect_status = response->status;
 
         err = resolve_redirect_url(
             current_url,
@@ -1839,6 +1967,19 @@ struct AmiAPIResponse *AmiAPI_RequestExecute(
             free(current_url);
             amiapi_set_error(ctx, err);
             return NULL;
+        }
+
+        /*
+         * Redirect method semantics:
+         *
+         * 301/302: preserve method and body.
+         * 303:     switch to GET and discard the body.
+         * 307/308: preserve method and body exactly.
+         */
+        if (redirect_status == 303) {
+            current_method = "GET";
+            current_body = NULL;
+            current_body_size = 0;
         }
 
         /*

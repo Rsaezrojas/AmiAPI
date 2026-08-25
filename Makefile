@@ -21,6 +21,7 @@ LIB := $(BUILD)/libamiapi.a
 HELLO := $(BUILD)/hello
 HTTPGET := $(BUILD)/httpget
 REQUESTGET := $(BUILD)/requestget
+REQUESTSEND := $(BUILD)/requestsend
 
 ifeq ($(PLATFORM),posix)
 TRANSPORT_SRC := src/transport_posix.c
@@ -70,9 +71,12 @@ $(HTTPGET): examples/httpget.c $(LIB)
 $(REQUESTGET): tests/requestget.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+$(REQUESTSEND): tests/requestsend.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 test: all
 ifeq ($(PLATFORM),posix)
-	$(MAKE) $(REQUESTGET)
+	$(MAKE) $(REQUESTGET) $(REQUESTSEND)
 	$(HELLO)
 	$(PYTHON) tests/test_http.py
 else
