@@ -1457,7 +1457,85 @@ def test_json_request_helper():
     print("JSON request helper test: OK")
 
 
+class FormRequestHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def do_POST(self):
+        size = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(size)
+
+        type(self).seen.append({
+            "content_type": self.headers.get("Content-Type"),
+            "body": body,
+            "length": size,
+        })
+
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_form_request_helper():
+    FormRequestHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), FormRequestHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            result = subprocess.run(
+                [
+                    "./build/formsend",
+                    f"http://127.0.0.1:{port}/token",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "form request helper failed\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert len(FormRequestHandler.seen) == 1
+
+    seen = FormRequestHandler.seen[0]
+
+    expected = (
+        b"grant_type=authorization+code&"
+        b"special=a%2Bb%26c%3Dd"
+    )
+
+    assert (
+        seen["content_type"]
+        == "application/x-www-form-urlencoded"
+    ), seen
+
+    assert seen["body"] == expected, seen
+    assert seen["length"] == len(expected), seen
+
+    print("Form request helper test: OK")
+
+
 def main():
+    test_form_request_helper()
     test_json_http_integration()
     test_json_request_helper()
     test_request_headers()
