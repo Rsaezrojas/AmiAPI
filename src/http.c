@@ -219,6 +219,52 @@ static enum AmiAPIError append_bytes(unsigned char **buffer, size_t *used,
     return AMIAPI_OK;
 }
 
+static enum AmiAPIError parse_content_length(
+    const struct AmiAPIResponse *response,
+    int *present,
+    size_t *value)
+{
+    const char *text;
+    size_t result;
+    size_t max_value;
+
+    if (!response || !present || !value)
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+
+    *present = 0;
+    *value = 0;
+
+    text = AmiAPI_Header(response, "Content-Length");
+    if (!text)
+        return AMIAPI_OK;
+
+    if (*text == '\0')
+        return AMIAPI_ERR_PROTOCOL;
+
+    result = 0;
+    max_value = (size_t)-1;
+
+    while (*text) {
+        unsigned int digit;
+
+        if (*text < '0' || *text > '9')
+            return AMIAPI_ERR_PROTOCOL;
+
+        digit = (unsigned int)(*text - '0');
+
+        if (result > (max_value - digit) / 10)
+            return AMIAPI_ERR_PROTOCOL;
+
+        result = result * 10 + digit;
+        ++text;
+    }
+
+    *present = 1;
+    *value = result;
+
+    return AMIAPI_OK;
+}
+
 struct AmiAPIResponse *AmiAPI_Get(struct AmiAPIContext *ctx, const char *url)
 {
     struct ParsedURL parsed;
@@ -227,6 +273,8 @@ struct AmiAPIResponse *AmiAPI_Get(struct AmiAPIContext *ctx, const char *url)
     enum AmiAPIError err;
     char *request = NULL, *header_copy = NULL;
     size_t request_size, raw_used = 0, raw_capacity = 0, header_size, initial_body, body_capacity = 0;
+    size_t content_length = 0;
+    int has_content_length = 0;
     unsigned char *chunk = NULL, *raw = NULL, *header_end = NULL;
     long n = 0;
 
@@ -316,18 +364,111 @@ struct AmiAPIResponse *AmiAPI_Get(struct AmiAPIContext *ctx, const char *url)
     free(header_copy); header_copy = NULL;
     if (err != AMIAPI_OK) goto fail;
 
-    if (initial_body > ctx->max_body) { err = AMIAPI_ERR_RESPONSE_TOO_LARGE; goto fail; }
-    err = append_bytes(&response->body, &response->body_size, &body_capacity,
-                       raw + header_size, initial_body, ctx->max_body);
-    if (err != AMIAPI_OK) goto fail;
-    free(raw); raw = NULL; raw_used = raw_capacity = 0;
+    err = parse_content_length(
+        response,
+        &has_content_length,
+        &content_length
+    );
+    if (err != AMIAPI_OK)
+        goto fail;
 
-    while ((n = amiapi_transport_receive(&transport, chunk, AMIAPI_READ_CHUNK)) > 0) {
-        err = append_bytes(&response->body, &response->body_size, &body_capacity,
-                           chunk, (size_t)n, ctx->max_body);
-        if (err != AMIAPI_OK) goto fail;
+    if (has_content_length && content_length > ctx->max_body) {
+        err = AMIAPI_ERR_RESPONSE_TOO_LARGE;
+        goto fail;
     }
-    if (n < 0) { err = AMIAPI_ERR_RECEIVE; goto fail; }
+
+    if (initial_body > ctx->max_body) {
+        err = AMIAPI_ERR_RESPONSE_TOO_LARGE;
+        goto fail;
+    }
+
+    if (has_content_length && initial_body > content_length) {
+        err = AMIAPI_ERR_PROTOCOL;
+        goto fail;
+    }
+
+    err = append_bytes(
+        &response->body,
+        &response->body_size,
+        &body_capacity,
+        raw + header_size,
+        initial_body,
+        ctx->max_body
+    );
+    if (err != AMIAPI_OK)
+        goto fail;
+
+    free(raw);
+    raw = NULL;
+    raw_used = raw_capacity = 0;
+
+    if (has_content_length) {
+        while (response->body_size < content_length) {
+            size_t remaining;
+            size_t request_amount;
+
+            remaining = content_length - response->body_size;
+            request_amount = remaining < AMIAPI_READ_CHUNK
+                ? remaining
+                : AMIAPI_READ_CHUNK;
+
+            n = amiapi_transport_receive(
+                &transport,
+                chunk,
+                request_amount
+            );
+
+            if (n < 0) {
+                err = AMIAPI_ERR_RECEIVE;
+                goto fail;
+            }
+
+            if (n == 0) {
+                /* Peer closed before the advertised body was complete. */
+                err = AMIAPI_ERR_PROTOCOL;
+                goto fail;
+            }
+
+            err = append_bytes(
+                &response->body,
+                &response->body_size,
+                &body_capacity,
+                chunk,
+                (size_t)n,
+                ctx->max_body
+            );
+            if (err != AMIAPI_OK)
+                goto fail;
+        }
+    }
+    else {
+        /*
+         * HTTP/1.0-style / connection-close framing fallback.
+         * Chunked transfer encoding is handled separately in a later
+         * HTTP framing milestone.
+         */
+        while ((n = amiapi_transport_receive(
+                    &transport,
+                    chunk,
+                    AMIAPI_READ_CHUNK)) > 0)
+        {
+            err = append_bytes(
+                &response->body,
+                &response->body_size,
+                &body_capacity,
+                chunk,
+                (size_t)n,
+                ctx->max_body
+            );
+            if (err != AMIAPI_OK)
+                goto fail;
+        }
+
+        if (n < 0) {
+            err = AMIAPI_ERR_RECEIVE;
+            goto fail;
+        }
+    }
 
     amiapi_transport_close(&transport);
     free(chunk);

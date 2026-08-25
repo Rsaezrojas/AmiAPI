@@ -23,6 +23,7 @@ HTTPGET := $(BUILD)/httpget
 
 ifeq ($(PLATFORM),posix)
 TRANSPORT_SRC := src/transport_posix.c
+LDLIBS += -lssl -lcrypto
 else ifeq ($(PLATFORM),amiga)
 TRANSPORT_SRC := src/transport_amiga.c
 else

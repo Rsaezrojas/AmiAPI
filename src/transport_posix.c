@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
@@ -6,7 +7,24 @@
 #include <netdb.h>
 #include <unistd.h>
 
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
 #include "internal.h"
+
+enum AmiAPIError amiapi_transport_prepare_tls(void)
+{
+    /*
+     * OpenSSL 1.1.0 and later initialize themselves automatically.
+     * OPENSSL_init_ssl() is still useful here because it gives us an
+     * explicit failure point for TLS initialization.
+     */
+    if (OPENSSL_init_ssl(0, NULL) != 1)
+        return AMIAPI_ERR_CONNECT;
+
+    return AMIAPI_OK;
+}
 
 enum AmiAPIError amiapi_transport_connect(struct AmiAPITransport *transport,
                                           const char *host,
@@ -22,21 +40,35 @@ enum AmiAPIError amiapi_transport_connect(struct AmiAPITransport *transport,
         return AMIAPI_ERR_INVALID_ARGUMENT;
 
     transport->fd = -1;
+    transport->tls_ctx = NULL;
+    transport->tls_ssl = NULL;
+    transport->use_tls = 0;
+
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     snprintf(service, sizeof(service), "%u", (unsigned int)port);
+
     rc = getaddrinfo(host, service, &hints, &result);
     if (rc != 0)
         return AMIAPI_ERR_DNS;
 
     for (it = result; it != NULL; it = it->ai_next) {
-        transport->fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        transport->fd = socket(
+            it->ai_family,
+            it->ai_socktype,
+            it->ai_protocol
+        );
+
         if (transport->fd < 0)
             continue;
 
-        if (connect(transport->fd, it->ai_addr, it->ai_addrlen) == 0)
+        if (connect(
+                transport->fd,
+                it->ai_addr,
+                it->ai_addrlen
+            ) == 0)
             break;
 
         close(transport->fd);
@@ -49,6 +81,86 @@ enum AmiAPIError amiapi_transport_connect(struct AmiAPITransport *transport,
         return AMIAPI_ERR_CONNECT;
 
     return AMIAPI_OK;
+}
+
+enum AmiAPIError amiapi_transport_start_tls(
+    struct AmiAPITransport *transport,
+    const char *host)
+{
+    SSL_CTX *ctx;
+    SSL *ssl;
+    X509_VERIFY_PARAM *param;
+
+    if (transport == NULL ||
+        transport->fd < 0 ||
+        host == NULL ||
+        host[0] == '\0')
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+
+    if (amiapi_transport_prepare_tls() != AMIAPI_OK)
+        return AMIAPI_ERR_CONNECT;
+
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx == NULL)
+        return AMIAPI_ERR_CONNECT;
+
+    /*
+     * Load the operating system's normal CA trust store.
+     */
+    if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        SSL_CTX_free(ctx);
+        return AMIAPI_ERR_CONNECT;
+    }
+
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+
+    ssl = SSL_new(ctx);
+    if (ssl == NULL) {
+        SSL_CTX_free(ctx);
+        return AMIAPI_ERR_CONNECT;
+    }
+
+    /*
+     * SNI tells virtual HTTPS servers which hostname we are connecting to.
+     */
+    if (SSL_set_tlsext_host_name(ssl, host) != 1)
+        goto fail;
+
+    /*
+     * SSL_VERIFY_PEER validates the certificate chain.  This additionally
+     * requires the certificate to be valid for the hostname in the URL.
+     */
+    param = SSL_get0_param(ssl);
+    if (param == NULL)
+        goto fail;
+
+    X509_VERIFY_PARAM_set_hostflags(
+        param,
+        X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS
+    );
+
+    if (X509_VERIFY_PARAM_set1_host(param, host, 0) != 1)
+        goto fail;
+
+    if (SSL_set_fd(ssl, transport->fd) != 1)
+        goto fail;
+
+    if (SSL_connect(ssl) != 1)
+        goto fail;
+
+    if (SSL_get_verify_result(ssl) != X509_V_OK)
+        goto fail;
+
+    transport->tls_ctx = ctx;
+    transport->tls_ssl = ssl;
+    transport->use_tls = 1;
+
+    return AMIAPI_OK;
+
+fail:
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    return AMIAPI_ERR_CONNECT;
 }
 
 enum AmiAPIError amiapi_transport_send_all(struct AmiAPITransport *transport,
@@ -65,15 +177,54 @@ enum AmiAPIError amiapi_transport_send_all(struct AmiAPITransport *transport,
     done = 0;
 
     while (done < size) {
-        ssize_t n = send(transport->fd, p + done, size - done, 0);
-        if (n < 0) {
-            if (errno == EINTR)
+        if (transport->use_tls) {
+            SSL *ssl = (SSL *)transport->tls_ssl;
+            int amount;
+            int n;
+            int ssl_error;
+
+            if (ssl == NULL)
+                return AMIAPI_ERR_SEND;
+
+            amount = size - done > (size_t)INT_MAX
+                ? INT_MAX
+                : (int)(size - done);
+
+            n = SSL_write(ssl, p + done, amount);
+
+            if (n > 0) {
+                done += (size_t)n;
                 continue;
+            }
+
+            ssl_error = SSL_get_error(ssl, n);
+
+            if (ssl_error == SSL_ERROR_WANT_READ ||
+                ssl_error == SSL_ERROR_WANT_WRITE)
+                continue;
+
             return AMIAPI_ERR_SEND;
         }
-        if (n == 0)
-            return AMIAPI_ERR_SEND;
-        done += (size_t)n;
+        else {
+            ssize_t n = send(
+                transport->fd,
+                p + done,
+                size - done,
+                0
+            );
+
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+
+                return AMIAPI_ERR_SEND;
+            }
+
+            if (n == 0)
+                return AMIAPI_ERR_SEND;
+
+            done += (size_t)n;
+        }
     }
 
     return AMIAPI_OK;
@@ -83,21 +234,79 @@ long amiapi_transport_receive(struct AmiAPITransport *transport,
                               void *buffer,
                               size_t size)
 {
-    ssize_t n;
-
-    if (transport == NULL || transport->fd < 0 || buffer == NULL || size == 0)
+    if (transport == NULL ||
+        transport->fd < 0 ||
+        buffer == NULL ||
+        size == 0)
         return -1;
 
-    do {
-        n = recv(transport->fd, buffer, size, 0);
-    } while (n < 0 && errno == EINTR);
+    if (transport->use_tls) {
+        SSL *ssl = (SSL *)transport->tls_ssl;
+        int amount;
+        int n;
+        int ssl_error;
 
-    return (long)n;
+        if (ssl == NULL)
+            return -1;
+
+        amount = size > (size_t)INT_MAX
+            ? INT_MAX
+            : (int)size;
+
+        for (;;) {
+            n = SSL_read(ssl, buffer, amount);
+
+            if (n > 0)
+                return (long)n;
+
+            ssl_error = SSL_get_error(ssl, n);
+
+            if (ssl_error == SSL_ERROR_ZERO_RETURN)
+                return 0;
+
+            if (ssl_error == SSL_ERROR_WANT_READ ||
+                ssl_error == SSL_ERROR_WANT_WRITE)
+                continue;
+
+            return -1;
+        }
+    }
+    else {
+        ssize_t n;
+
+        do {
+            n = recv(transport->fd, buffer, size, 0);
+        } while (n < 0 && errno == EINTR);
+
+        return (long)n;
+    }
 }
 
 void amiapi_transport_close(struct AmiAPITransport *transport)
 {
-    if (transport != NULL && transport->fd >= 0) {
+    if (transport == NULL)
+        return;
+
+    if (transport->tls_ssl != NULL) {
+        SSL *ssl = (SSL *)transport->tls_ssl;
+
+        /*
+         * Best-effort TLS close notification.  We deliberately do not
+         * block trying to complete a bidirectional shutdown here.
+         */
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        transport->tls_ssl = NULL;
+    }
+
+    if (transport->tls_ctx != NULL) {
+        SSL_CTX_free((SSL_CTX *)transport->tls_ctx);
+        transport->tls_ctx = NULL;
+    }
+
+    transport->use_tls = 0;
+
+    if (transport->fd >= 0) {
         close(transport->fd);
         transport->fd = -1;
     }
@@ -105,18 +314,4 @@ void amiapi_transport_close(struct AmiAPITransport *transport)
 
 void amiapi_transport_platform_cleanup(void)
 {
-}
-
-enum AmiAPIError amiapi_transport_prepare_tls(void)
-{
-    return AMIAPI_ERR_CONNECT;
-}
-
-enum AmiAPIError amiapi_transport_start_tls(
-    struct AmiAPITransport *transport,
-    const char *host)
-{
-    (void)transport;
-    (void)host;
-    return AMIAPI_ERR_CONNECT;
 }
