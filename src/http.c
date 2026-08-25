@@ -9,6 +9,7 @@
 #define AMIAPI_HEADER_LIMIT 32768UL
 #define AMIAPI_READ_CHUNK 4096UL
 #define AMIAPI_CHUNK_LINE_LIMIT 8192UL
+#define AMIAPI_MAX_REDIRECTS 8
 
 struct AmiAPIHeader { char *name; char *value; };
 struct AmiAPIResponse {
@@ -657,7 +658,9 @@ done:
     return err;
 }
 
-struct AmiAPIResponse *AmiAPI_Get(struct AmiAPIContext *ctx, const char *url)
+static struct AmiAPIResponse *amiapi_get_once(
+    struct AmiAPIContext *ctx,
+    const char *url)
 {
     struct ParsedURL parsed;
     struct AmiAPITransport transport;
@@ -901,6 +904,236 @@ fail:
     AmiAPI_FreeResponse(response);
     amiapi_set_error(ctx, err);
     return NULL;
+}
+
+
+static int is_redirect_status(int status)
+{
+    return status == 301 ||
+           status == 302 ||
+           status == 303 ||
+           status == 307 ||
+           status == 308;
+}
+
+static char *build_absolute_url(
+    const struct ParsedURL *base,
+    const char *path)
+{
+    const char *scheme;
+    int default_port;
+    size_t size;
+    char *result;
+
+    if (!base || !base->host || !path)
+        return NULL;
+
+    scheme = base->use_tls ? "https" : "http";
+    default_port = base->use_tls ? 443 : 80;
+
+    size =
+        strlen(scheme) +
+        3 +
+        strlen(base->host) +
+        strlen(path) +
+        16;
+
+    result = (char *)malloc(size);
+    if (!result)
+        return NULL;
+
+    if ((int)base->port == default_port) {
+        snprintf(
+            result,
+            size,
+            "%s://%s%s",
+            scheme,
+            base->host,
+            path
+        );
+    }
+    else {
+        snprintf(
+            result,
+            size,
+            "%s://%s:%u%s",
+            scheme,
+            base->host,
+            (unsigned int)base->port,
+            path
+        );
+    }
+
+    return result;
+}
+
+static enum AmiAPIError resolve_redirect_url(
+    const char *base_url,
+    const char *location,
+    char **resolved)
+{
+    struct ParsedURL base;
+    char *path = NULL;
+    char *slash;
+    size_t directory_len;
+    size_t location_len;
+
+    if (!base_url || !location || !resolved)
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+
+    *resolved = NULL;
+
+    if (*location == '\0')
+        return AMIAPI_ERR_PROTOCOL;
+
+    /*
+     * Absolute redirect.
+     */
+    if (strncmp(location, "http://", 7) == 0 ||
+        strncmp(location, "https://", 8) == 0)
+    {
+        *resolved = dup_range(location, strlen(location));
+
+        return *resolved
+            ? AMIAPI_OK
+            : AMIAPI_ERR_NO_MEMORY;
+    }
+
+    /*
+     * Reject unsupported absolute schemes rather than treating them
+     * as relative paths.
+     */
+    if (strstr(location, "://"))
+        return AMIAPI_ERR_UNSUPPORTED_SCHEME;
+
+    if (parse_http_url(base_url, &base) != AMIAPI_OK)
+        return AMIAPI_ERR_BAD_URL;
+
+    /*
+     * Root-relative redirect.
+     */
+    if (location[0] == '/') {
+        *resolved = build_absolute_url(&base, location);
+        free_parsed_url(&base);
+
+        return *resolved
+            ? AMIAPI_OK
+            : AMIAPI_ERR_NO_MEMORY;
+    }
+
+    /*
+     * Relative redirect. Resolve against the directory containing
+     * the current request path.
+     *
+     * M2.2 deliberately does not normalize "." or ".." path segments
+     * yet; most HTTP servers accept those segments as sent.
+     */
+    slash = strrchr(base.path, '/');
+
+    if (slash)
+        directory_len = (size_t)(slash - base.path) + 1;
+    else
+        directory_len = 1;
+
+    location_len = strlen(location);
+
+    if (directory_len > (size_t)-1 - location_len - 1) {
+        free_parsed_url(&base);
+        return AMIAPI_ERR_NO_MEMORY;
+    }
+
+    path = (char *)malloc(directory_len + location_len + 1);
+    if (!path) {
+        free_parsed_url(&base);
+        return AMIAPI_ERR_NO_MEMORY;
+    }
+
+    memcpy(path, base.path, directory_len);
+    memcpy(path + directory_len, location, location_len + 1);
+
+    *resolved = build_absolute_url(&base, path);
+
+    free(path);
+    free_parsed_url(&base);
+
+    return *resolved
+        ? AMIAPI_OK
+        : AMIAPI_ERR_NO_MEMORY;
+}
+
+struct AmiAPIResponse *AmiAPI_Get(
+    struct AmiAPIContext *ctx,
+    const char *url)
+{
+    struct AmiAPIResponse *response;
+    char *current_url;
+    char *next_url;
+    const char *location;
+    enum AmiAPIError err;
+    int redirects;
+
+    if (!ctx ||
+        ctx->magic != AMIAPI_CONTEXT_MAGIC ||
+        !url)
+    {
+        amiapi_set_error(ctx, AMIAPI_ERR_INVALID_ARGUMENT);
+        return NULL;
+    }
+
+    current_url = dup_range(url, strlen(url));
+    if (!current_url) {
+        amiapi_set_error(ctx, AMIAPI_ERR_NO_MEMORY);
+        return NULL;
+    }
+
+    for (redirects = 0; ; ++redirects) {
+        response = amiapi_get_once(ctx, current_url);
+
+        if (!response) {
+            free(current_url);
+            return NULL;
+        }
+
+        if (!is_redirect_status(response->status)) {
+            free(current_url);
+            amiapi_set_error(ctx, AMIAPI_OK);
+            return response;
+        }
+
+        if (redirects >= AMIAPI_MAX_REDIRECTS) {
+            AmiAPI_FreeResponse(response);
+            free(current_url);
+            amiapi_set_error(ctx, AMIAPI_ERR_PROTOCOL);
+            return NULL;
+        }
+
+        location = AmiAPI_Header(response, "Location");
+        if (!location || !*location) {
+            AmiAPI_FreeResponse(response);
+            free(current_url);
+            amiapi_set_error(ctx, AMIAPI_ERR_PROTOCOL);
+            return NULL;
+        }
+
+        next_url = NULL;
+
+        err = resolve_redirect_url(
+            current_url,
+            location,
+            &next_url
+        );
+
+        AmiAPI_FreeResponse(response);
+
+        if (err != AMIAPI_OK) {
+            free(current_url);
+            amiapi_set_error(ctx, err);
+            return NULL;
+        }
+
+        free(current_url);
+        current_url = next_url;
+    }
 }
 
 void AmiAPI_FreeResponse(struct AmiAPIResponse *response)

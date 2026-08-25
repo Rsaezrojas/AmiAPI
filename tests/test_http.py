@@ -474,12 +474,177 @@ def test_https_chunked():
     print("HTTPS chunked transfer test: OK")
 
 
+class RedirectHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def send_redirect(self, status, location):
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/start":
+            self.send_redirect(302, "/step2")
+            return
+
+        if self.path == "/step2":
+            self.send_redirect(307, "final")
+            return
+
+        if self.path == "/final":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"redirect")
+            return
+
+        if self.path.startswith("/loop"):
+            self.send_redirect(302, "/loop")
+            return
+
+        if self.path == "/missing":
+            self.send_response(302)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+
+        self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_redirects():
+    with TestServer(("127.0.0.1", 0), RedirectHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            result = run_httpget(
+                f"http://127.0.0.1:{port}/start"
+            )
+
+            loop = run_httpget(
+                f"http://127.0.0.1:{port}/loop"
+            )
+
+            missing = run_httpget(
+                f"http://127.0.0.1:{port}/missing"
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "redirect chain unexpectedly failed\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert "HTTP 200" in result.stdout, result.stdout
+    assert "body-bytes: 8" in result.stdout, result.stdout
+
+    if loop.returncode == 0:
+        raise AssertionError(
+            "redirect loop unexpectedly succeeded"
+        )
+
+    if missing.returncode == 0:
+        raise AssertionError(
+            "redirect without Location unexpectedly succeeded"
+        )
+
+    print("Redirect tests: OK")
+
+
+def test_http_to_https_redirect():
+    with tempfile.TemporaryDirectory(prefix="amiapi-redirect-") as tmp:
+        ca_cert, server_cert, server_key = make_certificates(tmp)
+
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.load_cert_chain(
+            certfile=server_cert,
+            keyfile=server_key,
+        )
+
+        with TestServer(("127.0.0.1", 0), Handler) as https_server:
+            https_server.socket = tls_context.wrap_socket(
+                https_server.socket,
+                server_side=True,
+            )
+
+            https_port = https_server.server_address[1]
+
+            https_thread = threading.Thread(
+                target=https_server.serve_forever,
+                daemon=True,
+            )
+            https_thread.start()
+
+            class UpgradeHandler(http.server.BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+
+                def do_GET(self):
+                    location = (
+                        f"https://localhost:{https_port}/hello"
+                    )
+
+                    self.send_response(302)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+
+                def log_message(self, fmt, *args):
+                    pass
+
+            with TestServer(("127.0.0.1", 0), UpgradeHandler) as http_server:
+                http_port = http_server.server_address[1]
+
+                http_thread = threading.Thread(
+                    target=http_server.serve_forever,
+                    daemon=True,
+                )
+                http_thread.start()
+
+                env = os.environ.copy()
+                env["SSL_CERT_FILE"] = str(ca_cert)
+
+                try:
+                    result = run_httpget(
+                        f"http://127.0.0.1:{http_port}/start",
+                        env=env,
+                    )
+                finally:
+                    http_server.shutdown()
+                    http_thread.join()
+                    https_server.shutdown()
+                    https_thread.join()
+
+    assert_success(result, "HTTP to HTTPS redirect")
+    print("HTTP to HTTPS redirect test: OK")
+
+
 def main():
     test_http()
     test_https()
     test_content_length_framing()
     test_chunked_transfer()
     test_https_chunked()
+    test_redirects()
+    test_http_to_https_redirect()
 
 
 if __name__ == "__main__":
