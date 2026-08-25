@@ -257,6 +257,223 @@ static int test_depth(void)
     return 1;
 }
 
+static int test_query_api(void)
+{
+    static const char json[] =
+        "{"
+        "\"name\":\"Ami\\u0041PI\","
+        "\"ok\":true,"
+        "\"count\":12345,"
+        "\"negative\":-42,"
+        "\"fraction\":1.5,"
+        "\"items\":[10,20,30],"
+        "\"escaped\\u005fkey\":\"yes\","
+        "\"emoji\":\"\\ud83d\\ude00\""
+        "}";
+
+    struct AmiAPIJsonDoc *doc;
+    const struct AmiAPIJsonValue *root;
+    const struct AmiAPIJsonValue *value;
+    const struct AmiAPIJsonValue *items;
+    enum AmiAPIJsonError error;
+    size_t offset;
+    size_t required;
+    char buffer[64];
+    long signed_value;
+    unsigned long unsigned_value;
+    int boolean;
+    const char *token;
+    size_t token_length;
+
+    error = AMIAPI_JSON_OK;
+    offset = 0;
+
+    doc = AmiAPI_JSONParse(
+        json,
+        strlen(json),
+        &error,
+        &offset
+    );
+
+    if (!doc) {
+        fprintf(
+            stderr,
+            "FAIL query JSON parse error=%d offset=%lu\n",
+            (int)error,
+            (unsigned long)offset
+        );
+        return 0;
+    }
+
+    root = AmiAPI_JSONRoot(doc);
+
+    value = AmiAPI_JSONObjectGet(doc, root, "name");
+
+    required = 0;
+
+    if (!value ||
+        AmiAPI_JSONStringCopy(
+            doc,
+            value,
+            buffer,
+            sizeof(buffer),
+            &required) != AMIAPI_JSON_OK ||
+        strcmp(buffer, "AmiAPI") != 0)
+    {
+        fprintf(stderr, "FAIL decoded name\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    value = AmiAPI_JSONObjectGet(doc, root, "ok");
+
+    if (!value ||
+        !AmiAPI_JSONBool(value, &boolean) ||
+        boolean != 1)
+    {
+        fprintf(stderr, "FAIL bool accessor\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    value = AmiAPI_JSONObjectGet(doc, root, "count");
+
+    if (!value ||
+        AmiAPI_JSONULong(
+            doc,
+            value,
+            &unsigned_value) != AMIAPI_JSON_OK ||
+        unsigned_value != 12345UL)
+    {
+        fprintf(stderr, "FAIL unsigned integer accessor\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    value = AmiAPI_JSONObjectGet(doc, root, "negative");
+
+    if (!value ||
+        AmiAPI_JSONLong(
+            doc,
+            value,
+            &signed_value) != AMIAPI_JSON_OK ||
+        signed_value != -42L)
+    {
+        fprintf(stderr, "FAIL signed integer accessor\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    value = AmiAPI_JSONObjectGet(doc, root, "fraction");
+
+    if (!value ||
+        AmiAPI_JSONLong(
+            doc,
+            value,
+            &signed_value) == AMIAPI_JSON_OK)
+    {
+        fprintf(stderr, "FAIL fractional integer rejection\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    if (AmiAPI_JSONNumberToken(
+            doc,
+            value,
+            &token,
+            &token_length) != AMIAPI_JSON_OK ||
+        token_length != 3 ||
+        memcmp(token, "1.5", 3) != 0)
+    {
+        fprintf(stderr, "FAIL number token accessor\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    items = AmiAPI_JSONObjectGet(doc, root, "items");
+
+    if (!items ||
+        AmiAPI_JSONArraySize(items) != 3)
+    {
+        fprintf(stderr, "FAIL array size\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    value = AmiAPI_JSONArrayGet(doc, items, 1);
+
+    if (!value ||
+        AmiAPI_JSONLong(
+            doc,
+            value,
+            &signed_value) != AMIAPI_JSON_OK ||
+        signed_value != 20L)
+    {
+        fprintf(stderr, "FAIL array access\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    if (AmiAPI_JSONArrayGet(doc, items, 99) != NULL) {
+        fprintf(stderr, "FAIL array bounds\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    value = AmiAPI_JSONObjectGet(
+        doc,
+        root,
+        "escaped_key"
+    );
+
+    if (!value) {
+        fprintf(stderr, "FAIL escaped object-key lookup\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    value = AmiAPI_JSONObjectGet(doc, root, "emoji");
+
+    required = 0;
+
+    if (!value ||
+        AmiAPI_JSONStringCopy(
+            doc,
+            value,
+            buffer,
+            sizeof(buffer),
+            &required) != AMIAPI_JSON_OK ||
+        required != 5 ||
+        (unsigned char)buffer[0] != 0xf0 ||
+        (unsigned char)buffer[1] != 0x9f ||
+        (unsigned char)buffer[2] != 0x98 ||
+        (unsigned char)buffer[3] != 0x80 ||
+        buffer[4] != '\0')
+    {
+        fprintf(stderr, "FAIL surrogate string decode\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    required = 0;
+
+    if (AmiAPI_JSONStringCopy(
+            doc,
+            value,
+            NULL,
+            0,
+            &required) != AMIAPI_JSON_OK ||
+        required != 5)
+    {
+        fprintf(stderr, "FAIL string size query\n");
+        AmiAPI_JSONFree(doc);
+        return 0;
+    }
+
+    AmiAPI_JSONFree(doc);
+    return 1;
+}
+
 int main(void)
 {
     static const struct TestCase cases[] = {
@@ -364,9 +581,13 @@ int main(void)
     if (!test_depth())
         return 1;
 
+    if (!test_query_api())
+        return 1;
+
     puts("JSON parser basic tests: OK");
     puts("JSON Unicode tests: OK");
     puts("JSON depth tests: OK");
+    puts("JSON query/value tests: OK");
 
     return 0;
 }

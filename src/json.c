@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1054,4 +1055,568 @@ enum AmiAPIJsonType AmiAPI_JSONType(
     return value
         ? value->type
         : AMIAPI_JSON_NULL;
+}
+
+static int json_value_belongs_to_doc(
+    const struct AmiAPIJsonDoc *doc,
+    const struct AmiAPIJsonValue *value)
+{
+    if (!doc || !value || !doc->values || doc->value_count == 0)
+        return 0;
+
+    return value >= doc->values &&
+           value < doc->values + doc->value_count;
+}
+
+static const struct AmiAPIJsonValue *json_child_at(
+    const struct AmiAPIJsonDoc *doc,
+    const struct AmiAPIJsonValue *parent,
+    size_t index)
+{
+    size_t child;
+
+    if (!json_value_belongs_to_doc(doc, parent))
+        return NULL;
+
+    if (index >= parent->child_count)
+        return NULL;
+
+    child = parent->first_child;
+
+    while (index > 0) {
+        if (child == JSON_NO_NODE ||
+            child >= doc->value_count)
+        {
+            return NULL;
+        }
+
+        child = doc->values[child].next_sibling;
+        --index;
+    }
+
+    if (child == JSON_NO_NODE ||
+        child >= doc->value_count)
+    {
+        return NULL;
+    }
+
+    return &doc->values[child];
+}
+
+static int json_decode_hex4_at(
+    const unsigned char *data,
+    size_t size,
+    size_t *pos,
+    uint32_t *value)
+{
+    uint32_t result;
+    int digit;
+    unsigned int i;
+
+    result = 0;
+
+    for (i = 0; i < 4; ++i) {
+        if (*pos >= size)
+            return 0;
+
+        digit = hex_digit_value(data[*pos]);
+
+        if (digit < 0)
+            return 0;
+
+        result = (result << 4) | (uint32_t)digit;
+        (*pos)++;
+    }
+
+    *value = result;
+    return 1;
+}
+
+static size_t utf8_encoded_size(uint32_t cp)
+{
+    if (cp <= 0x7fUL)
+        return 1;
+
+    if (cp <= 0x7ffUL)
+        return 2;
+
+    if (cp <= 0xffffUL)
+        return 3;
+
+    return 4;
+}
+
+static void utf8_write(
+    char *buffer,
+    size_t *used,
+    uint32_t cp)
+{
+    if (cp <= 0x7fUL) {
+        buffer[(*used)++] = (char)cp;
+    }
+    else if (cp <= 0x7ffUL) {
+        buffer[(*used)++] =
+            (char)(0xc0U | ((cp >> 6) & 0x1fU));
+
+        buffer[(*used)++] =
+            (char)(0x80U | (cp & 0x3fU));
+    }
+    else if (cp <= 0xffffUL) {
+        buffer[(*used)++] =
+            (char)(0xe0U | ((cp >> 12) & 0x0fU));
+
+        buffer[(*used)++] =
+            (char)(0x80U | ((cp >> 6) & 0x3fU));
+
+        buffer[(*used)++] =
+            (char)(0x80U | (cp & 0x3fU));
+    }
+    else {
+        buffer[(*used)++] =
+            (char)(0xf0U | ((cp >> 18) & 0x07U));
+
+        buffer[(*used)++] =
+            (char)(0x80U | ((cp >> 12) & 0x3fU));
+
+        buffer[(*used)++] =
+            (char)(0x80U | ((cp >> 6) & 0x3fU));
+
+        buffer[(*used)++] =
+            (char)(0x80U | (cp & 0x3fU));
+    }
+}
+
+/*
+ * Decode one already-validated JSON string token.
+ *
+ * If buffer is NULL, only the decoded size is calculated.
+ */
+static enum AmiAPIJsonError json_decode_string(
+    const unsigned char *data,
+    size_t size,
+    char *buffer,
+    size_t buffer_size,
+    size_t *required_size)
+{
+    size_t pos;
+    size_t used;
+    unsigned char c;
+    uint32_t cp;
+    uint32_t low;
+    size_t need;
+
+    if (!data || !required_size)
+        return AMIAPI_JSON_ERR_INVALID_ARGUMENT;
+
+    pos = 0;
+    used = 0;
+
+    while (pos < size) {
+        c = data[pos++];
+
+        if (c != '\\') {
+            need = 1;
+
+            if (buffer && used + need < buffer_size)
+                buffer[used] = (char)c;
+
+            used += need;
+            continue;
+        }
+
+        if (pos >= size)
+            return AMIAPI_JSON_ERR_SYNTAX;
+
+        c = data[pos++];
+
+        switch (c) {
+        case '"':  cp = '"';  break;
+        case '\\': cp = '\\'; break;
+        case '/':  cp = '/';  break;
+        case 'b':  cp = '\b'; break;
+        case 'f':  cp = '\f'; break;
+        case 'n':  cp = '\n'; break;
+        case 'r':  cp = '\r'; break;
+        case 't':  cp = '\t'; break;
+
+        case 'u':
+            if (!json_decode_hex4_at(
+                    data, size, &pos, &cp))
+            {
+                return AMIAPI_JSON_ERR_SYNTAX;
+            }
+
+            if (cp >= 0xd800UL &&
+                cp <= 0xdbffUL)
+            {
+                if (size - pos < 6 ||
+                    data[pos] != '\\' ||
+                    data[pos + 1] != 'u')
+                {
+                    return AMIAPI_JSON_ERR_UTF8;
+                }
+
+                pos += 2;
+
+                if (!json_decode_hex4_at(
+                        data, size, &pos, &low))
+                {
+                    return AMIAPI_JSON_ERR_SYNTAX;
+                }
+
+                if (low < 0xdc00UL ||
+                    low > 0xdfffUL)
+                {
+                    return AMIAPI_JSON_ERR_UTF8;
+                }
+
+                cp =
+                    0x10000UL +
+                    ((cp - 0xd800UL) << 10) +
+                    (low - 0xdc00UL);
+            }
+
+            need = utf8_encoded_size(cp);
+
+            if (buffer &&
+                used + need < buffer_size)
+            {
+                utf8_write(buffer, &used, cp);
+            }
+            else {
+                used += need;
+            }
+
+            continue;
+
+        default:
+            return AMIAPI_JSON_ERR_SYNTAX;
+        }
+
+        if (buffer && used + 1 < buffer_size)
+            buffer[used] = (char)cp;
+
+        used++;
+    }
+
+    /*
+     * required_size includes terminating NUL.
+     */
+    if (used == (size_t)-1)
+        return AMIAPI_JSON_ERR_NO_MEMORY;
+
+    *required_size = used + 1;
+
+    if (buffer && buffer_size > 0) {
+        if (used < buffer_size)
+            buffer[used] = '\0';
+        else
+            buffer[buffer_size - 1] = '\0';
+    }
+
+    if (buffer && buffer_size < used + 1)
+        return AMIAPI_JSON_ERR_NO_MEMORY;
+
+    return AMIAPI_JSON_OK;
+}
+
+static int json_key_equals(
+    const struct AmiAPIJsonDoc *doc,
+    const struct AmiAPIJsonValue *value,
+    const char *key)
+{
+    size_t required;
+    size_t key_len;
+    char *decoded;
+    enum AmiAPIJsonError err;
+    int equal;
+
+    if (!doc || !value || !key ||
+        value->key_start == JSON_NO_NODE)
+    {
+        return 0;
+    }
+
+    key_len = strlen(key);
+
+    /*
+     * Fast path: no escape in the stored key.
+     */
+    if (!memchr(
+            doc->data + value->key_start,
+            '\\',
+            value->key_length))
+    {
+        return value->key_length == key_len &&
+               memcmp(
+                   doc->data + value->key_start,
+                   key,
+                   key_len) == 0;
+    }
+
+    required = 0;
+
+    err = json_decode_string(
+        doc->data + value->key_start,
+        value->key_length,
+        NULL,
+        0,
+        &required
+    );
+
+    if (err != AMIAPI_JSON_OK || required == 0)
+        return 0;
+
+    decoded = (char *)malloc(required);
+    if (!decoded)
+        return 0;
+
+    err = json_decode_string(
+        doc->data + value->key_start,
+        value->key_length,
+        decoded,
+        required,
+        &required
+    );
+
+    equal =
+        err == AMIAPI_JSON_OK &&
+        strcmp(decoded, key) == 0;
+
+    free(decoded);
+    return equal;
+}
+
+const struct AmiAPIJsonValue *AmiAPI_JSONObjectGet(
+    const struct AmiAPIJsonDoc *doc,
+    const struct AmiAPIJsonValue *object,
+    const char *key)
+{
+    size_t child;
+
+    if (!json_value_belongs_to_doc(doc, object) ||
+        object->type != AMIAPI_JSON_OBJECT ||
+        !key)
+    {
+        return NULL;
+    }
+
+    child = object->first_child;
+
+    while (child != JSON_NO_NODE) {
+        if (child >= doc->value_count)
+            return NULL;
+
+        if (json_key_equals(
+                doc,
+                &doc->values[child],
+                key))
+        {
+            return &doc->values[child];
+        }
+
+        child = doc->values[child].next_sibling;
+    }
+
+    return NULL;
+}
+
+size_t AmiAPI_JSONArraySize(
+    const struct AmiAPIJsonValue *array)
+{
+    if (!array ||
+        array->type != AMIAPI_JSON_ARRAY)
+    {
+        return 0;
+    }
+
+    return array->child_count;
+}
+
+const struct AmiAPIJsonValue *AmiAPI_JSONArrayGet(
+    const struct AmiAPIJsonDoc *doc,
+    const struct AmiAPIJsonValue *array,
+    size_t index)
+{
+    if (!json_value_belongs_to_doc(doc, array) ||
+        array->type != AMIAPI_JSON_ARRAY)
+    {
+        return NULL;
+    }
+
+    return json_child_at(doc, array, index);
+}
+
+int AmiAPI_JSONBool(
+    const struct AmiAPIJsonValue *value,
+    int *result)
+{
+    if (!value ||
+        value->type != AMIAPI_JSON_BOOL ||
+        !result)
+    {
+        return 0;
+    }
+
+    *result = value->length == 4 ? 1 : 0;
+    return 1;
+}
+
+enum AmiAPIJsonError AmiAPI_JSONStringCopy(
+    const struct AmiAPIJsonDoc *doc,
+    const struct AmiAPIJsonValue *value,
+    char *buffer,
+    size_t buffer_size,
+    size_t *required_size)
+{
+    if (!json_value_belongs_to_doc(doc, value) ||
+        value->type != AMIAPI_JSON_STRING ||
+        !required_size ||
+        (!buffer && buffer_size != 0))
+    {
+        return AMIAPI_JSON_ERR_INVALID_ARGUMENT;
+    }
+
+    return json_decode_string(
+        doc->data + value->start,
+        value->length,
+        buffer,
+        buffer_size,
+        required_size
+    );
+}
+
+enum AmiAPIJsonError AmiAPI_JSONNumberToken(
+    const struct AmiAPIJsonDoc *doc,
+    const struct AmiAPIJsonValue *value,
+    const char **text,
+    size_t *length)
+{
+    if (!json_value_belongs_to_doc(doc, value) ||
+        value->type != AMIAPI_JSON_NUMBER ||
+        !text ||
+        !length)
+    {
+        return AMIAPI_JSON_ERR_INVALID_ARGUMENT;
+    }
+
+    *text = (const char *)(
+        doc->data + value->start
+    );
+
+    *length = value->length;
+
+    return AMIAPI_JSON_OK;
+}
+
+enum AmiAPIJsonError AmiAPI_JSONULong(
+    const struct AmiAPIJsonDoc *doc,
+    const struct AmiAPIJsonValue *value,
+    unsigned long *result)
+{
+    const char *text;
+    size_t len;
+    size_t i;
+    unsigned long n;
+    unsigned int digit;
+
+    if (!result)
+        return AMIAPI_JSON_ERR_INVALID_ARGUMENT;
+
+    if (AmiAPI_JSONNumberToken(
+            doc,
+            value,
+            &text,
+            &len) != AMIAPI_JSON_OK)
+    {
+        return AMIAPI_JSON_ERR_INVALID_ARGUMENT;
+    }
+
+    if (len == 0 || text[0] == '-')
+        return AMIAPI_JSON_ERR_SYNTAX;
+
+    n = 0;
+
+    for (i = 0; i < len; ++i) {
+        if (text[i] < '0' || text[i] > '9')
+            return AMIAPI_JSON_ERR_SYNTAX;
+
+        digit = (unsigned int)(text[i] - '0');
+
+        if (n >
+            (ULONG_MAX - digit) / 10UL)
+        {
+            return AMIAPI_JSON_ERR_SYNTAX;
+        }
+
+        n = n * 10UL + digit;
+    }
+
+    *result = n;
+    return AMIAPI_JSON_OK;
+}
+
+enum AmiAPIJsonError AmiAPI_JSONLong(
+    const struct AmiAPIJsonDoc *doc,
+    const struct AmiAPIJsonValue *value,
+    long *result)
+{
+    const char *text;
+    size_t len;
+    size_t i;
+    int negative;
+    unsigned long n;
+    unsigned long limit;
+    unsigned int digit;
+
+    if (!result)
+        return AMIAPI_JSON_ERR_INVALID_ARGUMENT;
+
+    if (AmiAPI_JSONNumberToken(
+            doc,
+            value,
+            &text,
+            &len) != AMIAPI_JSON_OK)
+    {
+        return AMIAPI_JSON_ERR_INVALID_ARGUMENT;
+    }
+
+    if (len == 0)
+        return AMIAPI_JSON_ERR_SYNTAX;
+
+    negative = text[0] == '-';
+    i = negative ? 1 : 0;
+
+    if (i == len)
+        return AMIAPI_JSON_ERR_SYNTAX;
+
+    limit = negative
+        ? (unsigned long)LONG_MAX + 1UL
+        : (unsigned long)LONG_MAX;
+
+    n = 0;
+
+    for (; i < len; ++i) {
+        if (text[i] < '0' || text[i] > '9')
+            return AMIAPI_JSON_ERR_SYNTAX;
+
+        digit = (unsigned int)(text[i] - '0');
+
+        if (n > (limit - digit) / 10UL)
+            return AMIAPI_JSON_ERR_SYNTAX;
+
+        n = n * 10UL + digit;
+    }
+
+    if (negative) {
+        if (n == (unsigned long)LONG_MAX + 1UL)
+            *result = LONG_MIN;
+        else
+            *result = -(long)n;
+    }
+    else {
+        *result = (long)n;
+    }
+
+    return AMIAPI_JSON_OK;
 }

@@ -47,6 +47,54 @@ enum AmiAPIJsonType AmiAPI_JSONType(
     const struct AmiAPIJsonValue *
 );
 
+const struct AmiAPIJsonValue *AmiAPI_JSONObjectGet(
+    const struct AmiAPIJsonDoc *,
+    const struct AmiAPIJsonValue *,
+    const char *
+);
+
+size_t AmiAPI_JSONArraySize(
+    const struct AmiAPIJsonValue *
+);
+
+const struct AmiAPIJsonValue *AmiAPI_JSONArrayGet(
+    const struct AmiAPIJsonDoc *,
+    const struct AmiAPIJsonValue *,
+    size_t
+);
+
+int AmiAPI_JSONBool(
+    const struct AmiAPIJsonValue *,
+    int *
+);
+
+enum AmiAPIJsonError AmiAPI_JSONStringCopy(
+    const struct AmiAPIJsonDoc *,
+    const struct AmiAPIJsonValue *,
+    char *,
+    size_t,
+    size_t *
+);
+
+enum AmiAPIJsonError AmiAPI_JSONLong(
+    const struct AmiAPIJsonDoc *,
+    const struct AmiAPIJsonValue *,
+    long *
+);
+
+enum AmiAPIJsonError AmiAPI_JSONULong(
+    const struct AmiAPIJsonDoc *,
+    const struct AmiAPIJsonValue *,
+    unsigned long *
+);
+
+enum AmiAPIJsonError AmiAPI_JSONNumberToken(
+    const struct AmiAPIJsonDoc *,
+    const struct AmiAPIJsonValue *,
+    const char **,
+    size_t *
+);
+
 #ifdef __cplusplus
 }
 #endif
