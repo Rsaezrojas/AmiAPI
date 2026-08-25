@@ -11,7 +11,20 @@
 #define AMIAPI_CHUNK_LINE_LIMIT 8192UL
 #define AMIAPI_MAX_REDIRECTS 8
 
-struct AmiAPIHeader { char *name; char *value; };
+struct AmiAPIHeader {
+    char *name;
+    char *value;
+    int sensitive;
+};
+
+struct AmiAPIRequest {
+    struct AmiAPIContext *ctx;
+    char *method;
+    char *url;
+    struct AmiAPIHeader *headers;
+    size_t header_count;
+};
+
 struct AmiAPIResponse {
     int status;
     struct AmiAPIHeader *headers;
@@ -204,6 +217,114 @@ static void trim_right(char *s)
     while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t')) s[--len] = '\0';
 }
 
+static int header_name_char_valid(unsigned char c)
+{
+    if (isalnum((int)c))
+        return 1;
+
+    switch (c) {
+    case '!':
+    case '#':
+    case '$':
+    case '%':
+    case '&':
+    case '\'':
+    case '*':
+    case '+':
+    case '-':
+    case '.':
+    case '^':
+    case '_':
+    case '`':
+    case '|':
+    case '~':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int request_header_valid(
+    const char *name,
+    const char *value)
+{
+    const unsigned char *p;
+
+    if (!name || !*name || !value)
+        return 0;
+
+    for (p = (const unsigned char *)name; *p; ++p) {
+        if (!header_name_char_valid(*p))
+            return 0;
+    }
+
+    for (p = (const unsigned char *)value; *p; ++p) {
+        /*
+         * Prevent CR/LF header injection and reject other C0 controls
+         * except horizontal tab.
+         */
+        if (*p == '\r' || *p == '\n')
+            return 0;
+
+        if (*p < 0x20 && *p != '\t')
+            return 0;
+
+        if (*p == 0x7f)
+            return 0;
+    }
+
+    return 1;
+}
+
+static int request_header_reserved(const char *name)
+{
+    return ascii_equal_ci(name, "Host") ||
+           ascii_equal_ci(name, "Content-Length") ||
+           ascii_equal_ci(name, "Transfer-Encoding") ||
+           ascii_equal_ci(name, "Connection");
+}
+
+static int request_header_sensitive(const char *name)
+{
+    return ascii_equal_ci(name, "Authorization") ||
+           ascii_equal_ci(name, "Cookie") ||
+           ascii_equal_ci(name, "Proxy-Authorization");
+}
+
+static struct AmiAPIHeader *request_find_header(
+    struct AmiAPIRequest *request,
+    const char *name)
+{
+    size_t i;
+
+    if (!request || !name)
+        return NULL;
+
+    for (i = 0; i < request->header_count; ++i) {
+        if (ascii_equal_ci(request->headers[i].name, name))
+            return &request->headers[i];
+    }
+
+    return NULL;
+}
+
+static int request_has_header(
+    const struct AmiAPIRequest *request,
+    const char *name)
+{
+    size_t i;
+
+    if (!request || !name)
+        return 0;
+
+    for (i = 0; i < request->header_count; ++i) {
+        if (ascii_equal_ci(request->headers[i].name, name))
+            return 1;
+    }
+
+    return 0;
+}
+
 static enum AmiAPIError add_header(struct AmiAPIResponse *r, const char *name, const char *value)
 {
     struct AmiAPIHeader *nh;
@@ -216,6 +337,7 @@ static enum AmiAPIError add_header(struct AmiAPIResponse *r, const char *name, c
     r->headers = nh;
     r->headers[r->header_count].name = n;
     r->headers[r->header_count].value = v;
+    r->headers[r->header_count].sensitive = 0;
     r->header_count++;
     return AMIAPI_OK;
 }
@@ -710,10 +832,39 @@ done:
     return err;
 }
 
-static struct AmiAPIResponse *amiapi_get_once(
-    struct AmiAPIContext *ctx,
-    const char *url)
+static int urls_same_origin(
+    const char *a_url,
+    const char *b_url)
 {
+    struct ParsedURL a;
+    struct ParsedURL b;
+    int same;
+
+    if (parse_http_url(a_url, &a) != AMIAPI_OK)
+        return 0;
+
+    if (parse_http_url(b_url, &b) != AMIAPI_OK) {
+        free_parsed_url(&a);
+        return 0;
+    }
+
+    same =
+        a.use_tls == b.use_tls &&
+        a.port == b.port &&
+        ascii_equal_ci(a.host, b.host);
+
+    free_parsed_url(&a);
+    free_parsed_url(&b);
+
+    return same;
+}
+
+static struct AmiAPIResponse *amiapi_get_once(
+    struct AmiAPIRequest *api_request,
+    const char *url,
+    int include_sensitive)
+{
+    struct AmiAPIContext *ctx;
     struct ParsedURL parsed;
     struct AmiAPITransport transport;
     struct AmiAPIResponse *response = NULL;
@@ -726,23 +877,119 @@ static struct AmiAPIResponse *amiapi_get_once(
     unsigned char *chunk = NULL, *raw = NULL, *header_end = NULL;
     long n = 0;
 
+    ctx = api_request ? api_request->ctx : NULL;
+
     transport.fd = -1;
     transport.tls_ctx = NULL;
     transport.tls_ssl = NULL;
     transport.use_tls = 0;
-    if (!ctx || ctx->magic != AMIAPI_CONTEXT_MAGIC || !url) {
+
+    if (!api_request ||
+        !ctx ||
+        ctx->magic != AMIAPI_CONTEXT_MAGIC ||
+        !url)
+    {
         amiapi_set_error(ctx, AMIAPI_ERR_INVALID_ARGUMENT); return NULL;
     }
     amiapi_set_error(ctx, AMIAPI_OK);
     err = parse_http_url(url, &parsed);
     if (err != AMIAPI_OK) { amiapi_set_error(ctx, err); return NULL; }
 
-    request_size = strlen(parsed.path) + strlen(parsed.host) + 128;
+    request_size =
+        strlen(api_request->method) +
+        strlen(parsed.path) +
+        strlen(parsed.host) +
+        strlen(AmiAPI_VersionString()) +
+        160;
+
+    {
+        size_t i;
+
+        for (i = 0; i < api_request->header_count; ++i) {
+            const struct AmiAPIHeader *h =
+                &api_request->headers[i];
+
+            if (!include_sensitive && h->sensitive)
+                continue;
+
+            if (request_size >
+                (size_t)-1 -
+                strlen(h->name) -
+                strlen(h->value) -
+                4)
+            {
+                free_parsed_url(&parsed);
+                amiapi_set_error(ctx, AMIAPI_ERR_NO_MEMORY);
+                return NULL;
+            }
+
+            request_size +=
+                strlen(h->name) +
+                strlen(h->value) +
+                4;
+        }
+    }
+
     request = (char *)malloc(request_size);
-    if (!request) { free_parsed_url(&parsed); amiapi_set_error(ctx, AMIAPI_ERR_NO_MEMORY); return NULL; }
-    snprintf(request, request_size,
-             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: AmiAPI/%s\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-             parsed.path, parsed.host, AmiAPI_VersionString());
+    if (!request) {
+        free_parsed_url(&parsed);
+        amiapi_set_error(ctx, AMIAPI_ERR_NO_MEMORY);
+        return NULL;
+    }
+
+    {
+        size_t used;
+        size_t i;
+
+        used = (size_t)snprintf(
+            request,
+            request_size,
+            "%s %s HTTP/1.1\r\n"
+            "Host: %s\r\n",
+            api_request->method,
+            parsed.path,
+            parsed.host
+        );
+
+        if (!request_has_header(api_request, "User-Agent")) {
+            used += (size_t)snprintf(
+                request + used,
+                request_size - used,
+                "User-Agent: AmiAPI/%s\r\n",
+                AmiAPI_VersionString()
+            );
+        }
+
+        if (!request_has_header(api_request, "Accept")) {
+            used += (size_t)snprintf(
+                request + used,
+                request_size - used,
+                "Accept: */*\r\n"
+            );
+        }
+
+        for (i = 0; i < api_request->header_count; ++i) {
+            const struct AmiAPIHeader *h =
+                &api_request->headers[i];
+
+            if (!include_sensitive && h->sensitive)
+                continue;
+
+            used += (size_t)snprintf(
+                request + used,
+                request_size - used,
+                "%s: %s\r\n",
+                h->name,
+                h->value
+            );
+        }
+
+        snprintf(
+            request + used,
+            request_size - used,
+            "Connection: close\r\n\r\n"
+        );
+    }
 
     if (parsed.use_tls)
         err = amiapi_transport_prepare_tls();
@@ -1352,33 +1599,204 @@ static enum AmiAPIError resolve_redirect_url(
         : AMIAPI_ERR_NO_MEMORY;
 }
 
-struct AmiAPIResponse *AmiAPI_Get(
+struct AmiAPIRequest *AmiAPI_RequestCreate(
     struct AmiAPIContext *ctx,
+    const char *method,
     const char *url)
 {
-    struct AmiAPIResponse *response;
-    char *current_url;
-    char *next_url;
-    const char *location;
-    enum AmiAPIError err;
-    int redirects;
+    struct AmiAPIRequest *request;
 
     if (!ctx ||
         ctx->magic != AMIAPI_CONTEXT_MAGIC ||
+        !method ||
         !url)
     {
         amiapi_set_error(ctx, AMIAPI_ERR_INVALID_ARGUMENT);
         return NULL;
     }
 
-    current_url = dup_range(url, strlen(url));
+    /*
+     * M2.3.1 deliberately starts with GET only.
+     */
+    if (!ascii_equal_ci(method, "GET")) {
+        amiapi_set_error(ctx, AMIAPI_ERR_INVALID_ARGUMENT);
+        return NULL;
+    }
+
+    request = (struct AmiAPIRequest *)calloc(
+        1,
+        sizeof(*request)
+    );
+
+    if (!request) {
+        amiapi_set_error(ctx, AMIAPI_ERR_NO_MEMORY);
+        return NULL;
+    }
+
+    request->ctx = ctx;
+    request->method = dup_range(method, strlen(method));
+    request->url = dup_range(url, strlen(url));
+
+    if (!request->method || !request->url) {
+        AmiAPI_RequestDestroy(request);
+        amiapi_set_error(ctx, AMIAPI_ERR_NO_MEMORY);
+        return NULL;
+    }
+
+    amiapi_set_error(ctx, AMIAPI_OK);
+    return request;
+}
+
+enum AmiAPIError AmiAPI_RequestSetHeader(
+    struct AmiAPIRequest *request,
+    const char *name,
+    const char *value)
+{
+    struct AmiAPIHeader *existing;
+    struct AmiAPIHeader *headers;
+    char *new_name;
+    char *new_value;
+
+    if (!request ||
+        !request->ctx ||
+        request->ctx->magic != AMIAPI_CONTEXT_MAGIC ||
+        !request_header_valid(name, value))
+    {
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+    }
+
+    if (request_header_reserved(name))
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+
+    existing = request_find_header(request, name);
+
+    if (existing) {
+        new_value = dup_range(value, strlen(value));
+        if (!new_value)
+            return AMIAPI_ERR_NO_MEMORY;
+
+        free(existing->value);
+        existing->value = new_value;
+        existing->sensitive = request_header_sensitive(name);
+
+        return AMIAPI_OK;
+    }
+
+    new_name = dup_range(name, strlen(name));
+    new_value = dup_range(value, strlen(value));
+
+    if (!new_name || !new_value) {
+        free(new_name);
+        free(new_value);
+        return AMIAPI_ERR_NO_MEMORY;
+    }
+
+    if (request->header_count == (size_t)-1) {
+        free(new_name);
+        free(new_value);
+        return AMIAPI_ERR_NO_MEMORY;
+    }
+
+    headers = (struct AmiAPIHeader *)realloc(
+        request->headers,
+        (request->header_count + 1) *
+            sizeof(*request->headers)
+    );
+
+    if (!headers) {
+        free(new_name);
+        free(new_value);
+        return AMIAPI_ERR_NO_MEMORY;
+    }
+
+    request->headers = headers;
+
+    request->headers[request->header_count].name = new_name;
+    request->headers[request->header_count].value = new_value;
+    request->headers[request->header_count].sensitive =
+        request_header_sensitive(name);
+
+    request->header_count++;
+
+    return AMIAPI_OK;
+}
+
+void AmiAPI_RequestClearHeaders(
+    struct AmiAPIRequest *request)
+{
+    size_t i;
+
+    if (!request)
+        return;
+
+    for (i = 0; i < request->header_count; ++i) {
+        free(request->headers[i].name);
+        free(request->headers[i].value);
+    }
+
+    free(request->headers);
+    request->headers = NULL;
+    request->header_count = 0;
+}
+
+void AmiAPI_RequestDestroy(
+    struct AmiAPIRequest *request)
+{
+    if (!request)
+        return;
+
+    AmiAPI_RequestClearHeaders(request);
+
+    free(request->method);
+    free(request->url);
+
+    request->method = NULL;
+    request->url = NULL;
+    request->ctx = NULL;
+
+    free(request);
+}
+
+struct AmiAPIResponse *AmiAPI_RequestExecute(
+    struct AmiAPIRequest *request)
+{
+    struct AmiAPIContext *ctx;
+    struct AmiAPIResponse *response;
+    char *current_url;
+    char *next_url;
+    const char *location;
+    enum AmiAPIError err;
+    int redirects;
+    int include_sensitive;
+
+    if (!request ||
+        !request->ctx ||
+        request->ctx->magic != AMIAPI_CONTEXT_MAGIC ||
+        !request->url)
+    {
+        return NULL;
+    }
+
+    ctx = request->ctx;
+
+    current_url = dup_range(
+        request->url,
+        strlen(request->url)
+    );
+
     if (!current_url) {
         amiapi_set_error(ctx, AMIAPI_ERR_NO_MEMORY);
         return NULL;
     }
 
+    include_sensitive = 1;
+
     for (redirects = 0; ; ++redirects) {
-        response = amiapi_get_once(ctx, current_url);
+        response = amiapi_get_once(
+            request,
+            current_url,
+            include_sensitive
+        );
 
         if (!response) {
             free(current_url);
@@ -1399,6 +1817,7 @@ struct AmiAPIResponse *AmiAPI_Get(
         }
 
         location = AmiAPI_Header(response, "Location");
+
         if (!location || !*location) {
             AmiAPI_FreeResponse(response);
             free(current_url);
@@ -1422,9 +1841,40 @@ struct AmiAPIResponse *AmiAPI_Get(
             return NULL;
         }
 
+        /*
+         * Authorization/Cookie/Proxy-Authorization must not cross an
+         * origin boundary.
+         */
+        include_sensitive =
+            include_sensitive &&
+            urls_same_origin(current_url, next_url);
+
         free(current_url);
         current_url = next_url;
     }
+}
+
+struct AmiAPIResponse *AmiAPI_Get(
+    struct AmiAPIContext *ctx,
+    const char *url)
+{
+    struct AmiAPIRequest *request;
+    struct AmiAPIResponse *response;
+
+    request = AmiAPI_RequestCreate(
+        ctx,
+        "GET",
+        url
+    );
+
+    if (!request)
+        return NULL;
+
+    response = AmiAPI_RequestExecute(request);
+
+    AmiAPI_RequestDestroy(request);
+
+    return response;
 }
 
 void AmiAPI_FreeResponse(struct AmiAPIResponse *response)

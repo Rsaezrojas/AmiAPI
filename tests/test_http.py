@@ -715,7 +715,307 @@ def test_http_to_https_redirect():
     print("HTTP to HTTPS redirect test: OK")
 
 
+class RequestHeaderHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    seen = []
+
+    def do_GET(self):
+        type(self).seen.append({
+            "path": self.path,
+            "authorization": self.headers.get("Authorization"),
+            "accept": self.headers.get("Accept"),
+            "user_agent": self.headers.get("User-Agent"),
+            "cookie": self.headers.get("Cookie"),
+        })
+
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_request_headers():
+    RequestHeaderHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), RequestHeaderHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            result = subprocess.run(
+                [
+                    "./build/requestget",
+                    f"http://127.0.0.1:{port}/headers",
+                    "Authorization", "Bearer secret-token",
+                    "Accept", "application/json",
+                    "User-Agent", "AmiAPI-Test/1",
+                    "X-AmiAPI-Test", "yes",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "custom request headers failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert len(RequestHeaderHandler.seen) == 1
+
+    seen = RequestHeaderHandler.seen[0]
+
+    assert seen["authorization"] == "Bearer secret-token"
+    assert seen["accept"] == "application/json"
+    assert seen["user_agent"] == "AmiAPI-Test/1"
+
+    print("Custom request header test: OK")
+
+
+def test_reserved_headers():
+    cases = [
+        ("Host", "example.invalid"),
+        ("Connection", "keep-alive"),
+        ("Content-Length", "123"),
+        ("Transfer-Encoding", "chunked"),
+    ]
+
+    for name, value in cases:
+        result = subprocess.run(
+            [
+                "./build/requestget",
+                "http://127.0.0.1:1/",
+                name,
+                value,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+
+        if result.returncode != 5:
+            raise AssertionError(
+                f"reserved header {name} was not rejected\n"
+                f"exit={result.returncode}\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+    print("Reserved request header tests: OK")
+
+
+def test_header_injection():
+    result = subprocess.run(
+        [
+            "./build/requestget",
+            "http://127.0.0.1:1/",
+            "X-Test",
+            "good\r\nInjected: bad",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+
+    if result.returncode != 5:
+        raise AssertionError(
+            "CR/LF request-header injection was not rejected"
+        )
+
+    print("Request header injection test: OK")
+
+
+class SameOriginAuthHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def do_GET(self):
+        type(self).seen.append(
+            (self.path, self.headers.get("Authorization"))
+        )
+
+        if self.path == "/start":
+            self.send_response(302)
+            self.send_header("Location", "/final")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+
+        if self.path == "/final":
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+
+        self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_sensitive_header_same_origin_redirect():
+    SameOriginAuthHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), SameOriginAuthHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            result = subprocess.run(
+                [
+                    "./build/requestget",
+                    f"http://127.0.0.1:{port}/start",
+                    "Authorization",
+                    "Bearer same-origin-secret",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "same-origin authorization redirect failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert SameOriginAuthHandler.seen == [
+        ("/start", "Bearer same-origin-secret"),
+        ("/final", "Bearer same-origin-secret"),
+    ], SameOriginAuthHandler.seen
+
+    print("Same-origin sensitive-header redirect test: OK")
+
+
+class CrossOriginTargetHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def do_GET(self):
+        type(self).seen.append(
+            (self.path, self.headers.get("Authorization"))
+        )
+
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_sensitive_header_cross_origin_redirect():
+    CrossOriginTargetHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), CrossOriginTargetHandler) as target:
+        target_port = target.server_address[1]
+
+        target_thread = threading.Thread(
+            target=target.serve_forever,
+            daemon=True,
+        )
+        target_thread.start()
+
+        class SourceHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            seen = []
+
+            def do_GET(self):
+                type(self).seen.append(
+                    (self.path, self.headers.get("Authorization"))
+                )
+
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://localhost:{target_port}/target",
+                )
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+            def log_message(self, fmt, *args):
+                pass
+
+        SourceHandler.seen = []
+
+        with TestServer(("127.0.0.1", 0), SourceHandler) as source:
+            source_port = source.server_address[1]
+
+            source_thread = threading.Thread(
+                target=source.serve_forever,
+                daemon=True,
+            )
+            source_thread.start()
+
+            try:
+                result = subprocess.run(
+                    [
+                        "./build/requestget",
+                        f"http://127.0.0.1:{source_port}/start",
+                        "Authorization",
+                        "Bearer cross-origin-secret",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                )
+            finally:
+                source.shutdown()
+                source_thread.join()
+                target.shutdown()
+                target_thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "cross-origin authorization redirect failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert SourceHandler.seen == [
+        ("/start", "Bearer cross-origin-secret"),
+    ], SourceHandler.seen
+
+    assert CrossOriginTargetHandler.seen == [
+        ("/target", None),
+    ], CrossOriginTargetHandler.seen
+
+    print("Cross-origin sensitive-header stripping test: OK")
+
+
 def main():
+    test_request_headers()
+    test_sensitive_header_same_origin_redirect()
+    test_sensitive_header_cross_origin_redirect()
+    test_reserved_headers()
+    test_header_injection()
     test_http()
     test_https()
     test_content_length_framing()
