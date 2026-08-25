@@ -59,14 +59,20 @@ static enum AmiAPIError parse_http_url(
     const char *input,
     struct ParsedURL *out)
 {
-    const char *p;
     const char *host_start;
-    const char *host_end;
+    const char *authority_end;
     const char *path_start;
+    const char *query_start;
+    const char *fragment_start;
     const char *colon;
+    const char *p;
     unsigned long port;
     size_t host_len;
     size_t scheme_len;
+    size_t target_len;
+
+    if (!input || !out)
+        return AMIAPI_ERR_INVALID_ARGUMENT;
 
     memset(out, 0, sizeof(*out));
 
@@ -93,14 +99,26 @@ static enum AmiAPIError parse_http_url(
         return AMIAPI_ERR_BAD_URL;
 
     path_start = strchr(host_start, '/');
+    query_start = strchr(host_start, '?');
+    fragment_start = strchr(host_start, '#');
 
-    host_end = path_start
-        ? path_start
-        : input + strlen(input);
+    authority_end = input + strlen(input);
+
+    if (path_start && path_start < authority_end)
+        authority_end = path_start;
+
+    if (query_start && query_start < authority_end)
+        authority_end = query_start;
+
+    if (fragment_start && fragment_start < authority_end)
+        authority_end = fragment_start;
+
+    if (authority_end == host_start)
+        return AMIAPI_ERR_BAD_URL;
 
     colon = NULL;
 
-    for (p = host_start; p < host_end; ++p) {
+    for (p = host_start; p < authority_end; ++p) {
         if (*p == ':')
             colon = p;
     }
@@ -108,32 +126,66 @@ static enum AmiAPIError parse_http_url(
     if (colon) {
         char *endptr;
 
-        if (colon == host_start || colon + 1 == host_end)
+        if (colon == host_start || colon + 1 == authority_end)
             return AMIAPI_ERR_BAD_URL;
 
         port = strtoul(colon + 1, &endptr, 10);
 
-        if (endptr != host_end ||
+        if (endptr != authority_end ||
             port == 0 ||
             port > 65535)
             return AMIAPI_ERR_BAD_URL;
 
-        host_end = colon;
+        authority_end = colon;
     }
 
-    host_len = (size_t)(host_end - host_start);
+    host_len = (size_t)(authority_end - host_start);
 
-    if (!host_len)
+    if (host_len == 0)
         return AMIAPI_ERR_BAD_URL;
 
     out->host = dup_range(host_start, host_len);
-
     if (!out->host)
         return AMIAPI_ERR_NO_MEMORY;
 
-    out->path = path_start
-        ? dup_range(path_start, strlen(path_start))
-        : dup_range("/", 1);
+    /*
+     * URL fragments are client-side only and must never appear in the
+     * HTTP request-target.
+     */
+    fragment_start = strchr(input + scheme_len, '#');
+
+    if (path_start &&
+        (!query_start || path_start < query_start) &&
+        (!fragment_start || path_start < fragment_start))
+    {
+        const char *target_end = fragment_start
+            ? fragment_start
+            : input + strlen(input);
+
+        target_len = (size_t)(target_end - path_start);
+
+        out->path = dup_range(path_start, target_len);
+    }
+    else if (query_start &&
+             (!fragment_start || query_start < fragment_start))
+    {
+        const char *target_end = fragment_start
+            ? fragment_start
+            : input + strlen(input);
+
+        size_t query_len = (size_t)(target_end - query_start);
+
+        out->path = (char *)malloc(query_len + 2);
+
+        if (out->path) {
+            out->path[0] = '/';
+            memcpy(out->path + 1, query_start, query_len);
+            out->path[query_len + 1] = '\0';
+        }
+    }
+    else {
+        out->path = dup_range("/", 1);
+    }
 
     if (!out->path) {
         free_parsed_url(out);
@@ -810,10 +862,14 @@ static struct AmiAPIResponse *amiapi_get_once(
             goto fail;
         }
 
-        if (has_content_length && initial_body > content_length) {
-            err = AMIAPI_ERR_PROTOCOL;
-            goto fail;
-        }
+        /*
+         * Content-Length is authoritative. The first transport read can
+         * contain bytes beyond the advertised response body. Since AmiAPI
+         * does not reuse this connection, ignore such surplus bytes rather
+         * than treating them as part of this response.
+         */
+        if (has_content_length && initial_body > content_length)
+            initial_body = content_length;
 
         err = append_bytes(
             &response->body,
@@ -967,53 +1023,258 @@ static char *build_absolute_url(
     return result;
 }
 
+static char *strip_fragment(const char *value)
+{
+    const char *fragment;
+    size_t len;
+
+    if (!value)
+        return NULL;
+
+    fragment = strchr(value, '#');
+    len = fragment
+        ? (size_t)(fragment - value)
+        : strlen(value);
+
+    return dup_range(value, len);
+}
+
+static char *normalize_url_path(const char *input)
+{
+    char *work;
+    char *query;
+    char *result;
+    char **segments;
+    size_t segment_count;
+    size_t max_segments;
+    size_t i;
+    size_t size;
+    char *p;
+    char *start;
+
+    if (!input || input[0] != '/')
+        return NULL;
+
+    work = dup_range(input, strlen(input));
+    if (!work)
+        return NULL;
+
+    query = strchr(work, '?');
+    if (query) {
+        *query = '\0';
+        ++query;
+    }
+
+    max_segments = strlen(work) / 2 + 2;
+
+    segments = (char **)calloc(max_segments, sizeof(*segments));
+    if (!segments) {
+        free(work);
+        return NULL;
+    }
+
+    segment_count = 0;
+    p = work + 1;
+
+    while (*p) {
+        start = p;
+
+        while (*p && *p != '/')
+            ++p;
+
+        if (*p) {
+            *p = '\0';
+            ++p;
+        }
+
+        if (strcmp(start, "") == 0 ||
+            strcmp(start, ".") == 0)
+        {
+            continue;
+        }
+
+        if (strcmp(start, "..") == 0) {
+            if (segment_count > 0)
+                --segment_count;
+
+            continue;
+        }
+
+        if (segment_count >= max_segments) {
+            free(segments);
+            free(work);
+            return NULL;
+        }
+
+        segments[segment_count++] = start;
+    }
+
+    size = 2;
+
+    for (i = 0; i < segment_count; ++i) {
+        if (size > (size_t)-1 - strlen(segments[i]) - 1) {
+            free(segments);
+            free(work);
+            return NULL;
+        }
+
+        size += strlen(segments[i]) + 1;
+    }
+
+    if (query) {
+        if (size > (size_t)-1 - strlen(query) - 1) {
+            free(segments);
+            free(work);
+            return NULL;
+        }
+
+        size += strlen(query) + 1;
+    }
+
+    result = (char *)malloc(size);
+    if (!result) {
+        free(segments);
+        free(work);
+        return NULL;
+    }
+
+    result[0] = '/';
+    result[1] = '\0';
+
+    for (i = 0; i < segment_count; ++i) {
+        if (i > 0)
+            strcat(result, "/");
+
+        strcat(result, segments[i]);
+    }
+
+    if (query) {
+        strcat(result, "?");
+        strcat(result, query);
+    }
+
+    free(segments);
+    free(work);
+
+    return result;
+}
+
 static enum AmiAPIError resolve_redirect_url(
     const char *base_url,
     const char *location,
     char **resolved)
 {
     struct ParsedURL base;
-    char *path = NULL;
+    char *clean_location = NULL;
+    char *base_path = NULL;
+    char *combined = NULL;
+    char *normalized = NULL;
     char *slash;
+    char *query;
     size_t directory_len;
     size_t location_len;
+    enum AmiAPIError err;
 
     if (!base_url || !location || !resolved)
         return AMIAPI_ERR_INVALID_ARGUMENT;
 
     *resolved = NULL;
 
-    if (*location == '\0')
+    clean_location = strip_fragment(location);
+    if (!clean_location)
+        return AMIAPI_ERR_NO_MEMORY;
+
+    /*
+     * A fragment-only redirect resolves to the same resource.
+     * Since fragments are not transmitted to the server, this would just
+     * create a redirect loop. Treat it as a protocol error.
+     */
+    if (*clean_location == '\0') {
+        free(clean_location);
         return AMIAPI_ERR_PROTOCOL;
+    }
 
     /*
      * Absolute redirect.
      */
-    if (strncmp(location, "http://", 7) == 0 ||
-        strncmp(location, "https://", 8) == 0)
+    if (strncmp(clean_location, "http://", 7) == 0 ||
+        strncmp(clean_location, "https://", 8) == 0)
     {
-        *resolved = dup_range(location, strlen(location));
+        *resolved = clean_location;
+        return AMIAPI_OK;
+    }
+
+    if (strstr(clean_location, "://")) {
+        free(clean_location);
+        return AMIAPI_ERR_UNSUPPORTED_SCHEME;
+    }
+
+    err = parse_http_url(base_url, &base);
+    if (err != AMIAPI_OK) {
+        free(clean_location);
+        return err;
+    }
+
+    /*
+     * Query-only redirect:
+     *
+     *     Location: ?page=2
+     *
+     * Keep the current path and replace its query.
+     */
+    if (clean_location[0] == '?') {
+        query = strchr(base.path, '?');
+
+        directory_len = query
+            ? (size_t)(query - base.path)
+            : strlen(base.path);
+
+        location_len = strlen(clean_location);
+
+        combined = (char *)malloc(
+            directory_len + location_len + 1
+        );
+
+        if (!combined) {
+            free(clean_location);
+            free_parsed_url(&base);
+            return AMIAPI_ERR_NO_MEMORY;
+        }
+
+        memcpy(combined, base.path, directory_len);
+        memcpy(
+            combined + directory_len,
+            clean_location,
+            location_len + 1
+        );
+
+        *resolved = build_absolute_url(&base, combined);
+
+        free(combined);
+        free(clean_location);
+        free_parsed_url(&base);
 
         return *resolved
             ? AMIAPI_OK
             : AMIAPI_ERR_NO_MEMORY;
     }
-
-    /*
-     * Reject unsupported absolute schemes rather than treating them
-     * as relative paths.
-     */
-    if (strstr(location, "://"))
-        return AMIAPI_ERR_UNSUPPORTED_SCHEME;
-
-    if (parse_http_url(base_url, &base) != AMIAPI_OK)
-        return AMIAPI_ERR_BAD_URL;
 
     /*
      * Root-relative redirect.
      */
-    if (location[0] == '/') {
-        *resolved = build_absolute_url(&base, location);
+    if (clean_location[0] == '/') {
+        normalized = normalize_url_path(clean_location);
+
+        if (!normalized) {
+            free(clean_location);
+            free_parsed_url(&base);
+            return AMIAPI_ERR_NO_MEMORY;
+        }
+
+        *resolved = build_absolute_url(&base, normalized);
+
+        free(normalized);
+        free(clean_location);
         free_parsed_url(&base);
 
         return *resolved
@@ -1022,38 +1283,68 @@ static enum AmiAPIError resolve_redirect_url(
     }
 
     /*
-     * Relative redirect. Resolve against the directory containing
-     * the current request path.
-     *
-     * M2.2 deliberately does not normalize "." or ".." path segments
-     * yet; most HTTP servers accept those segments as sent.
+     * Relative redirect. Strip the existing query from the base path before
+     * resolving against the base directory.
      */
-    slash = strrchr(base.path, '/');
+    base_path = dup_range(base.path, strlen(base.path));
+    if (!base_path) {
+        free(clean_location);
+        free_parsed_url(&base);
+        return AMIAPI_ERR_NO_MEMORY;
+    }
+
+    query = strchr(base_path, '?');
+    if (query)
+        *query = '\0';
+
+    slash = strrchr(base_path, '/');
 
     if (slash)
-        directory_len = (size_t)(slash - base.path) + 1;
+        directory_len = (size_t)(slash - base_path) + 1;
     else
         directory_len = 1;
 
-    location_len = strlen(location);
+    location_len = strlen(clean_location);
 
     if (directory_len > (size_t)-1 - location_len - 1) {
+        free(base_path);
+        free(clean_location);
         free_parsed_url(&base);
         return AMIAPI_ERR_NO_MEMORY;
     }
 
-    path = (char *)malloc(directory_len + location_len + 1);
-    if (!path) {
+    combined = (char *)malloc(
+        directory_len + location_len + 1
+    );
+
+    if (!combined) {
+        free(base_path);
+        free(clean_location);
         free_parsed_url(&base);
         return AMIAPI_ERR_NO_MEMORY;
     }
 
-    memcpy(path, base.path, directory_len);
-    memcpy(path + directory_len, location, location_len + 1);
+    memcpy(combined, base_path, directory_len);
+    memcpy(
+        combined + directory_len,
+        clean_location,
+        location_len + 1
+    );
 
-    *resolved = build_absolute_url(&base, path);
+    normalized = normalize_url_path(combined);
 
-    free(path);
+    free(combined);
+    free(base_path);
+    free(clean_location);
+
+    if (!normalized) {
+        free_parsed_url(&base);
+        return AMIAPI_ERR_NO_MEMORY;
+    }
+
+    *resolved = build_absolute_url(&base, normalized);
+
+    free(normalized);
     free_parsed_url(&base);
 
     return *resolved

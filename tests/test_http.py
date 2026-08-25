@@ -493,6 +493,49 @@ class RedirectHandler(http.server.BaseHTTPRequestHandler):
             self.send_redirect(307, "final")
             return
 
+        if self.path == "/a/b/start":
+            self.send_redirect(302, "../final")
+            return
+
+        if self.path == "/a/final":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+
+        if self.path == "/dot/start":
+            self.send_redirect(302, "./next")
+            return
+
+        if self.path == "/dot/next":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+
+        if self.path == "/query/start?old=1":
+            self.send_redirect(302, "?page=2")
+            return
+
+        if self.path == "/query/start?page=2":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+
+        if self.path == "/fragment/start":
+            self.send_redirect(302, "/final#client-only")
+            return
+
         if self.path == "/final":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -565,6 +608,41 @@ def test_redirects():
         raise AssertionError(
             "redirect without Location unexpectedly succeeded"
         )
+
+    # RFC-style relative redirect resolution.
+    cases = [
+        "/a/b/start",
+        "/dot/start",
+        "/query/start?old=1",
+        "/fragment/start",
+    ]
+
+    for path in cases:
+        with TestServer(("127.0.0.1", 0), RedirectHandler) as extra_server:
+            extra_port = extra_server.server_address[1]
+
+            extra_thread = threading.Thread(
+                target=extra_server.serve_forever,
+                daemon=True,
+            )
+            extra_thread.start()
+
+            try:
+                extra = run_httpget(
+                    f"http://127.0.0.1:{extra_port}{path}"
+                )
+            finally:
+                extra_server.shutdown()
+                extra_thread.join()
+
+        if extra.returncode != 0:
+            raise AssertionError(
+                f"redirect resolution failed for {path}\n"
+                f"stdout:\n{extra.stdout}\n"
+                f"stderr:\n{extra.stderr}"
+            )
+
+        assert "HTTP 200" in extra.stdout, extra.stdout
 
     print("Redirect tests: OK")
 
