@@ -29,6 +29,7 @@ TEST_URL := $(BUILD)/test_url
 TEST_FORM := $(BUILD)/test_form
 FORMSEND := $(BUILD)/formsend
 AUTHGET := $(BUILD)/authget
+BASICGET := $(BUILD)/basicget
 
 ifeq ($(PLATFORM),posix)
 TRANSPORT_SRC := src/transport_posix.c
@@ -122,9 +123,12 @@ $(FORMSEND): tests/formsend.c $(LIB)
 $(AUTHGET): tests/authget.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+$(BASICGET): tests/basicget.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 test: all
 ifeq ($(PLATFORM),posix)
-	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND) $(AUTHGET)
+	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND) $(AUTHGET) $(BASICGET)
 	$(HELLO)
 	$(PYTHON) tests/test_http.py
 	$(TEST_JSON)

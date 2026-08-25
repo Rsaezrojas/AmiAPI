@@ -12,6 +12,12 @@ enum AmiAPIError AmiAPI_RequestSetBearerToken(
     const char *
 );
 
+enum AmiAPIError AmiAPI_RequestSetBasicAuth(
+    struct AmiAPIRequest *,
+    const char *,
+    const char *
+);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1700,7 +1700,238 @@ def test_bearer_auth_cross_origin_redirect():
     print("Bearer cross-origin redirect test: OK")
 
 
+class BasicAuthHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def do_GET(self):
+        type(self).seen.append(
+            self.headers.get("Authorization")
+        )
+
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class BasicRedirectHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    target_port = None
+
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header(
+            "Location",
+            f"http://127.0.0.1:{type(self).target_port}/final",
+        )
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_basic_auth_helper():
+    BasicAuthHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), BasicAuthHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            result = subprocess.run(
+                [
+                    "./build/basicget",
+                    f"http://127.0.0.1:{port}/auth",
+                    "Aladdin",
+                    "open sesame",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "Basic auth helper failed\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert BasicAuthHandler.seen == [
+        "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+    ], BasicAuthHandler.seen
+
+    print("Basic auth helper test: OK")
+
+
+def test_basic_auth_edge_cases():
+    cases = [
+        ("user", ""),
+        ("", "password"),
+    ]
+
+    expected = [
+        "Basic dXNlcjo=",
+        "Basic OnBhc3N3b3Jk",
+    ]
+
+    for (username, password), expected_header in zip(cases, expected):
+        BasicAuthHandler.seen = []
+
+        with TestServer(("127.0.0.1", 0), BasicAuthHandler) as server:
+            port = server.server_address[1]
+
+            thread = threading.Thread(
+                target=server.serve_forever,
+                daemon=True,
+            )
+            thread.start()
+
+            try:
+                result = subprocess.run(
+                    [
+                        "./build/basicget",
+                        f"http://127.0.0.1:{port}/auth",
+                        username,
+                        password,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                )
+            finally:
+                server.shutdown()
+                thread.join()
+
+        if result.returncode != 0:
+            raise AssertionError(
+                "Basic auth edge case failed\n"
+                f"user={username!r}\n"
+                f"exit={result.returncode}\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+        assert BasicAuthHandler.seen == [
+            expected_header
+        ], BasicAuthHandler.seen
+
+    print("Basic auth edge-case tests: OK")
+
+
+def test_basic_auth_invalid_credentials():
+    cases = [
+        ("bad:user", "password"),
+        ("good\r\nInjected", "password"),
+        ("good\nInjected", "password"),
+        ("user", "bad\r\nInjected"),
+        ("user", "bad\nInjected"),
+    ]
+
+    for username, password in cases:
+        result = subprocess.run(
+            [
+                "./build/basicget",
+                "http://127.0.0.1:1/",
+                username,
+                password,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+
+        if result.returncode != 5:
+            raise AssertionError(
+                "invalid Basic credentials were not rejected\n"
+                f"user={username!r}\n"
+                f"password={password!r}\n"
+                f"exit={result.returncode}\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+    print("Basic auth validation tests: OK")
+
+
+def test_basic_auth_cross_origin_redirect():
+    BasicAuthHandler.seen = []
+
+    with TestServer(("127.0.0.1", 0), BasicAuthHandler) as target:
+        target_port = target.server_address[1]
+
+        target_thread = threading.Thread(
+            target=target.serve_forever,
+            daemon=True,
+        )
+        target_thread.start()
+
+        BasicRedirectHandler.target_port = target_port
+
+        with TestServer(
+            ("127.0.0.1", 0),
+            BasicRedirectHandler,
+        ) as source:
+            source_port = source.server_address[1]
+
+            source_thread = threading.Thread(
+                target=source.serve_forever,
+                daemon=True,
+            )
+            source_thread.start()
+
+            try:
+                result = subprocess.run(
+                    [
+                        "./build/basicget",
+                        f"http://127.0.0.1:{source_port}/start",
+                        "Aladdin",
+                        "open sesame",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                )
+            finally:
+                source.shutdown()
+                source_thread.join()
+
+        target.shutdown()
+        target_thread.join()
+
+    if result.returncode != 0:
+        raise AssertionError(
+            "Basic auth redirect test failed\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    assert BasicAuthHandler.seen == [None], BasicAuthHandler.seen
+
+    print("Basic cross-origin redirect test: OK")
+
+
 def main():
+    test_basic_auth_helper()
+    test_basic_auth_edge_cases()
+    test_basic_auth_invalid_credentials()
+    test_basic_auth_cross_origin_redirect()
     test_bearer_auth_helper()
     test_bearer_auth_invalid_tokens()
     test_bearer_auth_cross_origin_redirect()
