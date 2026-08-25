@@ -1,58 +1,519 @@
+#include "internal.h"
+
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
+
 #include <exec/types.h>
 #include <exec/libraries.h>
+
 #include <proto/exec.h>
-#include <sys/types.h>
+#include <proto/utility.h>
+#include <proto/alib.h>
+
+static struct Library *AmiAPIUtilityBase = NULL;
 static struct Library *AmiAPISocketBase = NULL;
 #define BSDSOCKET_BASE_NAME AmiAPISocketBase
 #include <proto/bsdsocket.h>
-#include <sys/socket.h>
+
+#include <proto/amisslmaster.h>
+#include <proto/amissl.h>
+
+#include <libraries/amisslmaster.h>
+#include <amissl/tags.h>
+
 #include <netdb.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
-#include <string.h>
-#include "internal.h"
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
+
+#ifndef AMIAPI_TLS_DEBUG
+#define AMIAPI_TLS_DEBUG 0
+#endif
+
+#if AMIAPI_TLS_DEBUG
+#define TLS_DEBUG(...) printf(__VA_ARGS__)
+#else
+#define TLS_DEBUG(...) ((void)0)
+#endif
+
+static const char amiga_stack_cookie[]
+    __attribute__((used)) = "$STACK:65536";
+
+static struct Library *AmiAPIMasterBase = NULL;
+static struct Library *AmiAPIAmiSSLBase = NULL;
+
+struct Library *AmiSSLMasterBase = NULL;
+struct Library *AmiSSLBase = NULL;
+
+/*
+ * AmiSSL is initialized lazily.  This lets plain HTTP continue to use
+ * only bsdsocket.library.
+ */
+static int amiapi_amissl_initialized = 0;
+
+static void generate_random_seed(
+    unsigned char *buffer,
+    int size)
+{
+    int i;
+
+    for (i = 0; i < size / 2; ++i) {
+        ((UWORD *)buffer)[i] = RangeRand(65535);
+    }
+}
 
 static enum AmiAPIError open_socket_library(void)
 {
-    if (AmiAPISocketBase) return AMIAPI_OK;
+    if (AmiAPISocketBase)
+        return AMIAPI_OK;
+
     AmiAPISocketBase = OpenLibrary("bsdsocket.library", 4);
-    return AmiAPISocketBase ? AMIAPI_OK : AMIAPI_ERR_SOCKET_LIBRARY;
+
+    return AmiAPISocketBase
+        ? AMIAPI_OK
+        : AMIAPI_ERR_SOCKET_LIBRARY;
 }
 
-enum AmiAPIError amiapi_transport_connect(struct AmiAPITransport *t, const char *host, unsigned short port)
+static enum AmiAPIError open_amissl(void)
 {
-    struct hostent *h; struct sockaddr_in a; enum AmiAPIError e; LONG fd;
-    if (!t || !host) return AMIAPI_ERR_INVALID_ARGUMENT;
-    t->fd = -1; e = open_socket_library(); if (e != AMIAPI_OK) return e;
-    h = gethostbyname((STRPTR)host);
-    if (!h || !h->h_addr_list || !h->h_addr_list[0]) return AMIAPI_ERR_DNS;
-    memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons(port);
-    memcpy(&a.sin_addr, h->h_addr_list[0], sizeof(a.sin_addr));
-    fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) return AMIAPI_ERR_CONNECT;
-    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { CloseSocket(fd); return AMIAPI_ERR_CONNECT; }
-    t->fd = (int)fd; return AMIAPI_OK;
-}
+    enum AmiAPIError err;
 
-enum AmiAPIError amiapi_transport_send_all(struct AmiAPITransport *t, const void *data, size_t size)
-{
-    const unsigned char *p; size_t done = 0;
-    if (!t || t->fd < 0 || !data) return AMIAPI_ERR_INVALID_ARGUMENT;
-    p = (const unsigned char *)data;
-    while (done < size) {
-        size_t rem = size - done; LONG n;
-        if (rem > 0x7fffffffUL) rem = 0x7fffffffUL;
-        n = send(t->fd, (char *)(p + done), (LONG)rem, 0);
-        if (n <= 0) return AMIAPI_ERR_SEND;
-        done += (size_t)n;
+    if (amiapi_amissl_initialized)
+        return AMIAPI_OK;
+
+    if (!AmiAPIUtilityBase) {
+        AmiAPIUtilityBase = OpenLibrary(
+            "utility.library",
+            0
+        );
+
+        if (!AmiAPIUtilityBase)
+            return AMIAPI_ERR_CONNECT;
     }
+
+    err = open_socket_library();
+    if (err != AMIAPI_OK)
+        return err;
+
+    AmiAPIMasterBase = OpenLibrary(
+        "amisslmaster.library",
+        AMISSLMASTER_MIN_VERSION
+    );
+
+    if (!AmiAPIMasterBase)
+        return AMIAPI_ERR_CONNECT;
+
+    /*
+     * AmiSSL inline/stub interfaces expect these conventional globals.
+     */
+    AmiSSLMasterBase = AmiAPIMasterBase;
+
+    if (!InitAmiSSLMaster(
+            AMISSL_CURRENT_VERSION,
+            TRUE))
+        goto fail;
+
+    AmiAPIAmiSSLBase = OpenAmiSSL();
+
+    if (!AmiAPIAmiSSLBase)
+        goto fail;
+
+    AmiSSLBase = AmiAPIAmiSSLBase;
+
+    if (InitAmiSSL(
+            AmiSSL_ErrNoPtr, (ULONG)&errno,
+            AmiSSL_SocketBase, (ULONG)AmiAPISocketBase,
+            TAG_DONE) != 0)
+        goto fail;
+
+    if (!OPENSSL_init_ssl(
+            OPENSSL_INIT_SSL_DEFAULT |
+            OPENSSL_INIT_ADD_ALL_CIPHERS |
+            OPENSSL_INIT_ADD_ALL_DIGESTS,
+            NULL))
+        goto fail_initialized;
+
+    {
+        unsigned char seed[128];
+
+        generate_random_seed(
+            seed,
+            (int)sizeof(seed)
+        );
+
+        RAND_seed(
+            seed,
+            (int)sizeof(seed)
+        );
+
+        memset(seed, 0, sizeof(seed));
+    }
+
+    amiapi_amissl_initialized = 1;
+    return AMIAPI_OK;
+
+fail_initialized:
+    CleanupAmiSSLA(NULL);
+
+fail:
+    if (AmiAPIAmiSSLBase) {
+        CloseAmiSSL();
+        AmiAPIAmiSSLBase = NULL;
+        AmiSSLBase = NULL;
+    }
+
+    if (AmiAPIMasterBase) {
+        CloseLibrary(AmiAPIMasterBase);
+        AmiAPIMasterBase = NULL;
+        AmiSSLMasterBase = NULL;
+    }
+
+    return AMIAPI_ERR_CONNECT;
+}
+
+enum AmiAPIError amiapi_transport_prepare_tls(void)
+{
+    return open_amissl();
+}
+
+enum AmiAPIError amiapi_transport_connect(
+    struct AmiAPITransport *t,
+    const char *host,
+    unsigned short port)
+{
+    struct hostent *h;
+    struct sockaddr_in a;
+    enum AmiAPIError e;
+    int fd;
+
+    if (!t || !host)
+        return AMIAPI_ERR_CONNECT;
+
+    t->fd = -1;
+    t->tls_ctx = NULL;
+    t->tls_ssl = NULL;
+    t->use_tls = 0;
+
+    e = open_socket_library();
+    if (e != AMIAPI_OK)
+        return e;
+
+    h = (struct hostent *)gethostbyname((STRPTR)host);
+    if (!h || !h->h_addr_list || !h->h_addr_list[0])
+        return AMIAPI_ERR_DNS;
+
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+
+    memcpy(
+        &a.sin_addr,
+        h->h_addr_list[0],
+        sizeof(a.sin_addr)
+    );
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return AMIAPI_ERR_CONNECT;
+
+    if (connect(
+            fd,
+            (struct sockaddr *)&a,
+            sizeof(a)) < 0)
+    {
+        CloseSocket(fd);
+        return AMIAPI_ERR_CONNECT;
+    }
+
+    t->fd = fd;
     return AMIAPI_OK;
 }
-long amiapi_transport_receive(struct AmiAPITransport *t, void *buf, size_t size)
+
+enum AmiAPIError amiapi_transport_start_tls(
+    struct AmiAPITransport *t,
+    const char *host)
 {
-    size_t req; if (!t || t->fd < 0 || !buf || !size) return -1;
-    req = size; if (req > 0x7fffffffUL) req = 0x7fffffffUL;
-    return (long)recv(t->fd, (char *)buf, (LONG)req, 0);
+    SSL_CTX *ctx = NULL;
+    SSL *ssl = NULL;
+    enum AmiAPIError err;
+    int rc;
+
+    if (!t || t->fd < 0 || !host)
+        return AMIAPI_ERR_CONNECT;
+
+    TLS_DEBUG("TLS: initializing AmiSSL\n");
+
+    err = open_amissl();
+    if (err != AMIAPI_OK) {
+        printf("TLS: open_amissl failed: %d\n", (int)err);
+        return err;
+    }
+
+    TLS_DEBUG("TLS: SSL_CTX_new\n");
+
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        unsigned long e = ERR_get_error();
+        printf("TLS: SSL_CTX_new failed ERR=%08lx\n", e);
+        return AMIAPI_ERR_CONNECT;
+    }
+
+    rc = SSL_CTX_set_default_verify_paths(ctx);
+    TLS_DEBUG("TLS: default verify paths rc=%d\n", rc);
+
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+
+    TLS_DEBUG("TLS: SSL_new\n");
+
+    ssl = SSL_new(ctx);
+    if (!ssl) {
+        unsigned long e = ERR_get_error();
+        printf("TLS: SSL_new failed ERR=%08lx\n", e);
+        SSL_CTX_free(ctx);
+        return AMIAPI_ERR_CONNECT;
+    }
+
+    rc = SSL_set_fd(ssl, t->fd);
+    TLS_DEBUG("TLS: SSL_set_fd rc=%d\n", rc);
+
+    if (rc != 1)
+        goto fail;
+
+    rc = SSL_set_tlsext_host_name(ssl, host);
+    TLS_DEBUG("TLS: SNI rc=%d\n", rc);
+
+    if (rc != 1)
+        goto fail;
+
+    TLS_DEBUG("TLS: SSL_connect\n");
+
+    rc = SSL_connect(ssl);
+
+    TLS_DEBUG("TLS: SSL_connect rc=%d\n", rc);
+
+    if (rc != 1) {
+        int ssl_err = SSL_get_error(ssl, rc);
+        unsigned long e = ERR_get_error();
+
+        printf(
+            "TLS: handshake failed "
+            "SSL_get_error=%d ERR=%08lx errno=%d\n",
+            ssl_err,
+            e,
+            errno
+        );
+
+        goto fail;
+    }
+
+    TLS_DEBUG(
+        "TLS: connected %s / %s\n",
+        SSL_get_version(ssl),
+        SSL_get_cipher(ssl)
+    );
+
+    t->tls_ctx = ctx;
+    t->tls_ssl = ssl;
+    t->use_tls = 1;
+
+    return AMIAPI_OK;
+
+fail:
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    return AMIAPI_ERR_CONNECT;
 }
+
+enum AmiAPIError amiapi_transport_send_all(
+    struct AmiAPITransport *t,
+    const void *data,
+    size_t size)
+{
+    const unsigned char *p;
+    size_t done;
+
+    if (!t || t->fd < 0 || !data)
+        return AMIAPI_ERR_CONNECT;
+
+    p = (const unsigned char *)data;
+    done = 0;
+
+    while (done < size) {
+        if (t->use_tls) {
+            SSL *ssl = (SSL *)t->tls_ssl;
+            int n;
+            int ssl_err;
+
+            n = SSL_write(
+                ssl,
+                p + done,
+                size - done
+            );
+
+            if (n > 0) {
+                done += (size_t)n;
+                continue;
+            }
+
+            ssl_err = SSL_get_error(ssl, n);
+
+            if (ssl_err == SSL_ERROR_WANT_READ ||
+                ssl_err == SSL_ERROR_WANT_WRITE)
+                continue;
+
+            {
+                unsigned long errcode = ERR_get_error();
+
+                fprintf(
+                    stderr,
+                    "AmiAPI TLS write failed: "
+                    "SSL_write=%d SSL_get_error=%d "
+                    "ERR=%08lx errno=%d\n",
+                    n,
+                    ssl_err,
+                    errcode,
+                    errno
+                );
+            }
+
+            return AMIAPI_ERR_CONNECT;
+        }
+        else {
+            long n;
+
+            /*
+             * bsdsocket's prototype is not const-correct on this SDK.
+             */
+            n = send(
+                t->fd,
+                (void *)(p + done),
+                size - done,
+                0
+            );
+
+            if (n <= 0)
+                return AMIAPI_ERR_CONNECT;
+
+            done += (size_t)n;
+        }
+    }
+
+    return AMIAPI_OK;
+}
+
+long amiapi_transport_receive(
+    struct AmiAPITransport *t,
+    void *buf,
+    size_t size)
+{
+    if (!t || t->fd < 0 || !buf || size == 0)
+        return -1;
+
+    if (t->use_tls) {
+        SSL *ssl = (SSL *)t->tls_ssl;
+
+        for (;;) {
+            int n;
+            int ssl_err;
+
+            n = SSL_read(
+                ssl,
+                buf,
+                size
+            );
+
+            if (n > 0)
+                return (long)n;
+
+            ssl_err = SSL_get_error(ssl, n);
+
+            if (ssl_err == SSL_ERROR_ZERO_RETURN)
+                return 0;
+
+            if (ssl_err == SSL_ERROR_WANT_READ ||
+                ssl_err == SSL_ERROR_WANT_WRITE)
+                continue;
+
+            /*
+             * Keep this diagnostic while HTTPS is being qualified.
+             * It tells us whether a remaining failure is TLS or socket I/O.
+             */
+            {
+                unsigned long errcode = ERR_get_error();
+
+                fprintf(
+                    stderr,
+                    "AmiAPI TLS read failed: "
+                    "SSL_read=%d SSL_get_error=%d "
+                    "ERR=%08lx errno=%d\n",
+                    n,
+                    ssl_err,
+                    errcode,
+                    errno
+                );
+            }
+
+            return -1;
+        }
+    }
+
+    return recv(t->fd, buf, size, 0);
+}
+
 void amiapi_transport_close(struct AmiAPITransport *t)
-{ if (t && t->fd >= 0) { CloseSocket(t->fd); t->fd = -1; } }
+{
+    if (!t)
+        return;
+
+    if (t->tls_ssl) {
+        SSL_shutdown((SSL *)t->tls_ssl);
+        SSL_free((SSL *)t->tls_ssl);
+        t->tls_ssl = NULL;
+    }
+
+    if (t->fd >= 0) {
+        CloseSocket(t->fd);
+        t->fd = -1;
+    }
+
+    if (t->tls_ctx) {
+        SSL_CTX_free((SSL_CTX *)t->tls_ctx);
+        t->tls_ctx = NULL;
+    }
+
+    t->use_tls = 0;
+}
+
 void amiapi_transport_platform_cleanup(void)
-{ if (AmiAPISocketBase) { CloseLibrary(AmiAPISocketBase); AmiAPISocketBase = NULL; } }
+{
+    if (amiapi_amissl_initialized) {
+        CleanupAmiSSLA(NULL);
+        amiapi_amissl_initialized = 0;
+    }
+
+    if (AmiAPIAmiSSLBase) {
+        CloseAmiSSL();
+        AmiAPIAmiSSLBase = NULL;
+        AmiSSLBase = NULL;
+    }
+
+    if (AmiAPIMasterBase) {
+        CloseLibrary(AmiAPIMasterBase);
+        AmiAPIMasterBase = NULL;
+        AmiSSLMasterBase = NULL;
+    }
+
+    if (AmiAPISocketBase) {
+        CloseLibrary(AmiAPISocketBase);
+        AmiAPISocketBase = NULL;
+    }
+
+    if (AmiAPIUtilityBase) {
+        CloseLibrary(AmiAPIUtilityBase);
+        AmiAPIUtilityBase = NULL;
+    }
+}

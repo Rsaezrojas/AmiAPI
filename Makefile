@@ -1,11 +1,20 @@
 PLATFORM ?= posix
 
-CC ?= cc
-AR ?= ar
 CFLAGS ?= -O2 -Wall -Wextra -pedantic
 CPPFLAGS ?= -Iinclude
 ARFLAGS ?= rcs
 PYTHON ?= python3
+
+ifeq ($(PLATFORM),amiga)
+ifeq ($(origin CC),default)
+CC := m68k-amigaos-gcc
+endif
+ifeq ($(origin AR),default)
+AR := m68k-amigaos-ar
+endif
+CFLAGS += -m68020
+CPPFLAGS += -I/opt/amiga/AmiSSL/Developer/include
+endif
 
 BUILD := build
 LIB := $(BUILD)/libamiapi.a
@@ -51,10 +60,10 @@ $(LIB): $(LIB_OBJS)
 	$(AR) $(ARFLAGS) $@ $^
 
 $(HELLO): examples/hello.c $(LIB)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
 $(HTTPGET): examples/httpget.c $(LIB)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
 test: all
 ifeq ($(PLATFORM),posix)

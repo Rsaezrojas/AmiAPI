@@ -106,3 +106,17 @@ void amiapi_transport_close(struct AmiAPITransport *transport)
 void amiapi_transport_platform_cleanup(void)
 {
 }
+
+enum AmiAPIError amiapi_transport_prepare_tls(void)
+{
+    return AMIAPI_ERR_CONNECT;
+}
+
+enum AmiAPIError amiapi_transport_start_tls(
+    struct AmiAPITransport *transport,
+    const char *host)
+{
+    (void)transport;
+    (void)host;
+    return AMIAPI_ERR_CONNECT;
+}

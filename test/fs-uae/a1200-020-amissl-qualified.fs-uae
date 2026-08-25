@@ -1,0 +1,17 @@
+# AmiAPI qualified FS-UAE 3.2.35 HTTPS test profile
+
+[fs-uae]
+amiga_model = A1200/020
+bsdsocket_library = 1
+chip_memory = 2048
+fast_memory = 8192
+floppy_drive_count = 4
+fpu = 68882
+
+hard_drive_0 = Workbench
+hard_drive_1 = Work
+hard_drive_2 = Net
+
+# Required for reliable modern TLS testing on the emulated 68020.
+accuracy = -1
+uae_cpu_speed = max

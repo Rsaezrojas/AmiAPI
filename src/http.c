@@ -17,7 +17,12 @@ struct AmiAPIResponse {
     unsigned char *body;
     size_t body_size;
 };
-struct ParsedURL { char *host; char *path; unsigned short port; };
+struct ParsedURL {
+    char *host;
+    char *path;
+    unsigned short port;
+    int use_tls;
+};
 
 static char *dup_range(const char *start, size_t len)
 {
@@ -48,37 +53,93 @@ static void free_parsed_url(struct ParsedURL *url)
     url->host = NULL; url->path = NULL;
 }
 
-static enum AmiAPIError parse_http_url(const char *input, struct ParsedURL *out)
+static enum AmiAPIError parse_http_url(
+    const char *input,
+    struct ParsedURL *out)
 {
-    const char *p, *host_start, *host_end, *path_start, *colon;
+    const char *p;
+    const char *host_start;
+    const char *host_end;
+    const char *path_start;
+    const char *colon;
     unsigned long port;
     size_t host_len;
+    size_t scheme_len;
+
     memset(out, 0, sizeof(*out));
-    if (strncmp(input, "http://", 7) != 0) {
-        if (strstr(input, "://")) return AMIAPI_ERR_UNSUPPORTED_SCHEME;
+
+    if (strncmp(input, "https://", 8) == 0) {
+        scheme_len = 8;
+        port = 443;
+        out->use_tls = 1;
+    }
+    else if (strncmp(input, "http://", 7) == 0) {
+        scheme_len = 7;
+        port = 80;
+        out->use_tls = 0;
+    }
+    else {
+        if (strstr(input, "://"))
+            return AMIAPI_ERR_UNSUPPORTED_SCHEME;
+
         return AMIAPI_ERR_BAD_URL;
     }
-    host_start = input + 7;
-    if (*host_start == '\0') return AMIAPI_ERR_BAD_URL;
+
+    host_start = input + scheme_len;
+
+    if (*host_start == '\0')
+        return AMIAPI_ERR_BAD_URL;
+
     path_start = strchr(host_start, '/');
-    host_end = path_start ? path_start : input + strlen(input);
+
+    host_end = path_start
+        ? path_start
+        : input + strlen(input);
+
     colon = NULL;
-    for (p = host_start; p < host_end; ++p) if (*p == ':') colon = p;
-    port = 80;
+
+    for (p = host_start; p < host_end; ++p) {
+        if (*p == ':')
+            colon = p;
+    }
+
     if (colon) {
         char *endptr;
-        if (colon == host_start || colon + 1 == host_end) return AMIAPI_ERR_BAD_URL;
+
+        if (colon == host_start || colon + 1 == host_end)
+            return AMIAPI_ERR_BAD_URL;
+
         port = strtoul(colon + 1, &endptr, 10);
-        if (endptr != host_end || port == 0 || port > 65535) return AMIAPI_ERR_BAD_URL;
+
+        if (endptr != host_end ||
+            port == 0 ||
+            port > 65535)
+            return AMIAPI_ERR_BAD_URL;
+
         host_end = colon;
     }
+
     host_len = (size_t)(host_end - host_start);
-    if (!host_len) return AMIAPI_ERR_BAD_URL;
+
+    if (!host_len)
+        return AMIAPI_ERR_BAD_URL;
+
     out->host = dup_range(host_start, host_len);
-    if (!out->host) return AMIAPI_ERR_NO_MEMORY;
-    out->path = path_start ? dup_range(path_start, strlen(path_start)) : dup_range("/", 1);
-    if (!out->path) { free_parsed_url(out); return AMIAPI_ERR_NO_MEMORY; }
+
+    if (!out->host)
+        return AMIAPI_ERR_NO_MEMORY;
+
+    out->path = path_start
+        ? dup_range(path_start, strlen(path_start))
+        : dup_range("/", 1);
+
+    if (!out->path) {
+        free_parsed_url(out);
+        return AMIAPI_ERR_NO_MEMORY;
+    }
+
     out->port = (unsigned short)port;
+
     return AMIAPI_OK;
 }
 
@@ -170,6 +231,9 @@ struct AmiAPIResponse *AmiAPI_Get(struct AmiAPIContext *ctx, const char *url)
     long n = 0;
 
     transport.fd = -1;
+    transport.tls_ctx = NULL;
+    transport.tls_ssl = NULL;
+    transport.use_tls = 0;
     if (!ctx || ctx->magic != AMIAPI_CONTEXT_MAGIC || !url) {
         amiapi_set_error(ctx, AMIAPI_ERR_INVALID_ARGUMENT); return NULL;
     }
@@ -184,10 +248,40 @@ struct AmiAPIResponse *AmiAPI_Get(struct AmiAPIContext *ctx, const char *url)
              "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: AmiAPI/%s\r\nAccept: */*\r\nConnection: close\r\n\r\n",
              parsed.path, parsed.host, AmiAPI_VersionString());
 
-    err = amiapi_transport_connect(&transport, parsed.host, parsed.port);
-    if (err == AMIAPI_OK) err = amiapi_transport_send_all(&transport, request, strlen(request));
-    free(request); request = NULL; free_parsed_url(&parsed);
-    if (err != AMIAPI_OK) goto fail;
+    if (parsed.use_tls)
+        err = amiapi_transport_prepare_tls();
+    else
+        err = AMIAPI_OK;
+
+    if (err == AMIAPI_OK) {
+        err = amiapi_transport_connect(
+            &transport,
+            parsed.host,
+            parsed.port
+        );
+    }
+
+    if (err == AMIAPI_OK && parsed.use_tls) {
+        err = amiapi_transport_start_tls(
+            &transport,
+            parsed.host
+        );
+    }
+
+    if (err == AMIAPI_OK) {
+        err = amiapi_transport_send_all(
+            &transport,
+            request,
+            strlen(request)
+        );
+    }
+
+    free(request);
+    request = NULL;
+    free_parsed_url(&parsed);
+
+    if (err != AMIAPI_OK)
+        goto fail;
 
     /* Heap-backed deliberately: classic Amiga process stacks can be tiny. */
     chunk = (unsigned char *)malloc(AMIAPI_READ_CHUNK);
