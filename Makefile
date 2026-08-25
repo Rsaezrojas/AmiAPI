@@ -25,6 +25,7 @@ REQUESTSEND := $(BUILD)/requestsend
 TEST_JSON := $(BUILD)/test_json
 JSONHTTP := $(BUILD)/jsonhttp
 JSONSEND := $(BUILD)/jsonsend
+TEST_URL := $(BUILD)/test_url
 
 ifeq ($(PLATFORM),posix)
 TRANSPORT_SRC := src/transport_posix.c
@@ -43,6 +44,7 @@ LIB_OBJS := \
 	$(BUILD)/http.o \
 	$(BUILD)/json.o \
 	$(BUILD)/json_http.o \
+	$(BUILD)/url.o \
 	$(TRANSPORT_OBJ)
 
 .PHONY: all clean test print-config
@@ -65,6 +67,9 @@ $(BUILD)/json.o: src/json.c include/amiapi/json.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/json_http.o: src/json_http.c include/amiapi/json_http.h include/amiapi/json.h include/amiapi/amiapi.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/url.o: src/url.c include/amiapi/url.h include/amiapi/errors.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(TRANSPORT_OBJ): $(TRANSPORT_SRC) src/internal.h | $(BUILD)
@@ -94,12 +99,16 @@ $(JSONHTTP): tests/jsonhttp.c $(LIB)
 $(JSONSEND): tests/jsonsend.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+$(TEST_URL): tests/test_url.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 test: all
 ifeq ($(PLATFORM),posix)
-	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND)
+	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL)
 	$(HELLO)
 	$(PYTHON) tests/test_http.py
 	$(TEST_JSON)
+	$(TEST_URL)
 else
 	@echo "Host integration tests are only run with PLATFORM=posix."
 endif
