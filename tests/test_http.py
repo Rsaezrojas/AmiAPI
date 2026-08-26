@@ -492,8 +492,12 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/length":
             body = STREAM_BODY
             self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Stream-Test", "length")
+            self.send_header("X-Duplicate", "first")
+            self.send_header("X-Duplicate", "second")
+            self.send_header("X-Final", "yes")
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
@@ -522,6 +526,7 @@ class StreamingHandler(http.server.BaseHTTPRequestHandler):
             body = b"NEVER"
             self.send_response(302)
             self.send_header("Location", "/length")
+            self.send_header("X-Intermediate", "must-not-survive")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
             self.end_headers()
@@ -541,6 +546,13 @@ def run_streamget(method, url, max_body=None, fail_call=None, env=None):
         command.append(str(fail_call))
     return subprocess.run(
         command, text=True, capture_output=True, timeout=15, env=env
+    )
+
+
+def run_progressget(method, mode, url, cancel_call=0, env=None):
+    return subprocess.run(
+        ["./build/progressget", method, mode, url, str(cancel_call)],
+        text=True, capture_output=True, timeout=15, env=env,
     )
 
 
@@ -599,6 +611,81 @@ def test_streaming_responses():
     print("Streaming response tests: OK")
 
 
+def assert_progress(result, received, total, label):
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{label} unexpectedly failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert f"received: {received}" in result.stdout, result.stdout
+    assert f"total: {total}" in result.stdout, result.stdout
+
+
+def test_progress_and_response_headers():
+    with TestServer(("127.0.0.1", 0), StreamingHandler) as server:
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            length = run_progressget("GET", "buffer", base + "/length")
+            assert_progress(length, len(STREAM_BODY), len(STREAM_BODY),
+                            "buffered Content-Length progress")
+            assert f"body-size: {len(STREAM_BODY)}" in length.stdout
+            assert "Content-Type: application/octet-stream" in length.stdout
+            assert "content-type: application/octet-stream" in length.stdout
+            assert "X-Duplicate: first" in length.stdout
+            assert "X-Missing: (null)" in length.stdout
+            assert "invalid-header-args: 1" in length.stdout
+
+            large = run_progressget("GET", "buffer", base + "/large")
+            assert_progress(large, len(LARGE_STREAM_BODY),
+                            len(LARGE_STREAM_BODY), "large progress")
+            calls = int(large.stdout.split("progress-calls: ", 1)[1].splitlines()[0])
+            assert calls > 1, large.stdout
+
+            streamed = run_progressget("GET", "stream", base + "/length")
+            assert_progress(streamed, len(STREAM_BODY), len(STREAM_BODY),
+                            "streamed progress")
+            assert f"streamed: {len(STREAM_BODY)}" in streamed.stdout
+            assert "body-size: 0" in streamed.stdout
+
+            failed_body = run_progressget(
+                "GET", "failstream", base + "/length"
+            )
+            assert failed_body.returncode == 20, failed_body.stdout
+            assert "last-error: 3" in failed_body.stdout, failed_body.stdout
+            assert "progress-calls: 0" in failed_body.stdout, failed_body.stdout
+
+            chunked = run_progressget("GET", "buffer", base + "/chunked")
+            assert_progress(chunked, len(STREAM_BODY), 0, "chunked progress")
+            eof = run_progressget("GET", "buffer", base + "/eof")
+            assert_progress(eof, len(STREAM_BODY), 0, "EOF progress")
+
+            redirected = run_progressget("GET", "buffer", base + "/redirect")
+            assert_progress(redirected, len(STREAM_BODY), len(STREAM_BODY),
+                            "redirect progress")
+            assert "X-Final: yes" in redirected.stdout
+            assert "X-Intermediate: (null)" in redirected.stdout
+
+            head = run_progressget("HEAD", "buffer", base + "/length")
+            assert_progress(head, 0, 0, "HEAD progress")
+            assert "progress-calls: 0" in head.stdout
+
+            for mode in ("buffer", "stream"):
+                cancelled = run_progressget(
+                    "GET", mode, base + "/large", cancel_call=1
+                )
+                assert cancelled.returncode == 20, cancelled.stdout
+                assert "last-error: 15" in cancelled.stdout, cancelled.stdout
+                assert "progress-calls: 1" in cancelled.stdout, cancelled.stdout
+        finally:
+            server.shutdown()
+            thread.join()
+
+    print("Progress, cancellation, and response header tests: OK")
+
+
 AMIAPI_DEFAULT_MAX_BODY_PY = 1024 * 1024
 
 
@@ -618,10 +705,17 @@ def test_https_streaming():
                 result = run_streamget(
                     "GET", f"https://localhost:{port}/chunked", env=env
                 )
+                progress = run_progressget(
+                    "GET", "buffer", f"https://localhost:{port}/length",
+                    env=env,
+                )
             finally:
                 server.shutdown()
                 thread.join()
     assert_stream(result, STREAM_BODY, "HTTPS stream")
+    assert_progress(progress, len(STREAM_BODY), len(STREAM_BODY),
+                    "HTTPS progress")
+    assert "Content-Type: application/octet-stream" in progress.stdout
     print("HTTPS streaming response test: OK")
 
 
@@ -651,8 +745,11 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(LARGE_DOWNLOAD_BODY)))
             self.send_header("Connection", "close")
             self.end_headers()
-            for offset in range(0, len(LARGE_DOWNLOAD_BODY), 4096):
-                self.wfile.write(LARGE_DOWNLOAD_BODY[offset:offset + 4096])
+            try:
+                for offset in range(0, len(LARGE_DOWNLOAD_BODY), 4096):
+                    self.wfile.write(LARGE_DOWNLOAD_BODY[offset:offset + 4096])
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif self.path == "/chunked":
             self.send_response(200)
             self.send_header("Transfer-Encoding", "chunked")
@@ -704,6 +801,16 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(DOWNLOAD_BODY[8:])
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        elif self.path == "/cancel-preserve":
+            Path(self.headers["X-Create-Destination"]).write_bytes(b"preserved")
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(LARGE_DOWNLOAD_BODY)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(LARGE_DOWNLOAD_BODY)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         else:
             self.send_error(404)
 
@@ -712,10 +819,10 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
 
 
 def run_download(method, url, destination, max_body=AMIAPI_DEFAULT_MAX_BODY_PY,
-                 timeout=5, headers=(), env=None):
+                 timeout=5, cancel_call=0, headers=(), env=None):
     command = [
         "./build/downloadget", method, url, str(destination),
-        str(max_body), str(timeout),
+        str(max_body), str(timeout), str(cancel_call),
     ]
     for name, value in headers:
         command.extend((name, value))
@@ -744,6 +851,9 @@ def test_file_downloads():
                     assert result.returncode == 0, result.stdout + result.stderr
                     assert destination.read_bytes() == DOWNLOAD_BODY
                     assert_no_download_temporary(destination)
+                    expected_total = len(DOWNLOAD_BODY) if endpoint == "length" else 0
+                    assert f"received: {len(DOWNLOAD_BODY)}" in result.stdout
+                    assert f"total: {expected_total}" in result.stdout
 
                 large = directory / "large"
                 result = run_download("GET", base + "/large", large,
@@ -789,6 +899,28 @@ def test_file_downloads():
                 assert result.returncode == 20, result.stdout + result.stderr
                 assert existing.read_bytes() == b"preserved"
                 assert_no_download_temporary(existing)
+
+                cancelled = directory / "cancelled"
+                result = run_download(
+                    "GET", base + "/large", cancelled,
+                    max_body=len(LARGE_DOWNLOAD_BODY), cancel_call=1,
+                )
+                assert result.returncode == 20, result.stdout + result.stderr
+                assert "error: 15" in result.stdout, result.stdout
+                assert "last-error: 15" in result.stdout, result.stdout
+                assert not cancelled.exists()
+                assert_no_download_temporary(cancelled)
+
+                preserved = directory / "cancel-preserved"
+                result = run_download(
+                    "GET", base + "/cancel-preserve", preserved,
+                    max_body=len(LARGE_DOWNLOAD_BODY), cancel_call=1,
+                    headers=(("X-Create-Destination", str(preserved)),),
+                )
+                assert result.returncode == 20, result.stdout + result.stderr
+                assert "error: 15" in result.stdout, result.stdout
+                assert preserved.read_bytes() == b"preserved"
+                assert_no_download_temporary(preserved)
 
                 missing_parent = directory / "missing" / "file"
                 result = run_download("GET", base + "/length", missing_parent)
@@ -2473,6 +2605,7 @@ def main():
     test_chunked_transfer()
     test_https_chunked()
     test_streaming_responses()
+    test_progress_and_response_headers()
     test_https_streaming()
     test_file_downloads()
     test_https_file_download()

@@ -32,6 +32,7 @@ A stock A1200 with Fast RAM is the reference performance class.
 - JSON parsing and JSON HTTP helpers
 - bounded response buffering
 - incremental response-body callbacks
+- response header lookup and cooperative progress/cancellation
 - safe streaming downloads to files
 - configurable network timeout
 - POSIX backend for host-side development and testing
@@ -89,6 +90,33 @@ should not concurrently download to the same destination path.
 
 The receive scratch buffer is heap-backed to remain safe with the small
 process stacks commonly used on classic AmigaOS.
+
+## Response headers and progress
+
+`AmiAPI_Header(response, name)` performs a case-insensitive lookup on the
+final response. It returns the first occurrence of a duplicated header, or
+`NULL` when absent. The returned string is read-only response-owned storage;
+it remains valid only until `AmiAPI_FreeResponse(response)`. Streamed requests
+retain final status and headers in their response object. Download helpers
+return only an error code and therefore do not expose response headers.
+
+Requests can report decoded response-body progress:
+
+    AmiAPI_RequestSetProgressCallback(request, progress, userdata);
+
+The callback receives cumulative decoded bytes accepted by the body sink and
+the validated Content-Length when known. `total` is zero for chunked and
+EOF-framed bodies. Updates occur after each decoded segment is successfully
+buffered, delivered to the body callback, or written to the download temporary
+file; no allocation or timer is used per update, and callers must not depend on
+socket-read frequency. HEAD and intermediate redirect bodies emit no updates.
+
+Returning nonzero continues the request. Returning zero cancels at the next
+progress update with `AMIAPI_ERR_CANCELLED`, closes the transport, and fails
+the request. Download cancellation removes the temporary file and never
+publishes a partial destination. Passing a `NULL` callback disables progress.
+This is cooperative cancellation; AmiAPI remains synchronous and does not use
+threads or asynchronous I/O.
 
 ## Building
 

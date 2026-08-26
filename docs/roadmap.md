@@ -57,21 +57,22 @@ DNS resolver timeout remains controlled by the platform TCP/IP stack.
 - decoded maximum-body enforcement and cleanup on failure
 - conservative preservation of existing destination files on POSIX and AmigaOS
 
+### SDK/API hardening
+
+- final-response header lookup with documented ownership and duplicate policy
+- decoded-body progress for buffered, streamed, and downloaded responses
+- cooperative callback cancellation with safe download cleanup
+- complete public error-string coverage
+- focused API review for the first real application
+
 ## Next milestones
 
-### SDK stabilization
+### AmiWeather
 
-- public API review
-- error model review
-- documentation
-- examples
-- compatibility qualification
-- release packaging
+Native Amiga weather client using the Open-Meteo API. AmiWeather will be the
+first real application to exercise the hardened SDK.
 
-### First real API client
+### AmiFreesound
 
-Open-Meteo remains the small reference API integration.
-
-### SampleScout
-
-Freesound-based native Amiga client built on AmiAPI.
+Native Amiga Freesound client, planned after AmiWeather and other small
+real-world SDK consumers.

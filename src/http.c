@@ -28,6 +28,8 @@ struct AmiAPIRequest {
     size_t body_size;
     AmiAPIBodyCallback response_callback;
     void *response_userdata;
+    AmiAPIProgressCallback progress_callback;
+    void *progress_userdata;
 };
 
 struct AmiAPIResponse {
@@ -471,6 +473,9 @@ struct AmiAPIBodySink {
     size_t total;
     size_t capacity;
     size_t limit;
+    size_t expected_total;
+    AmiAPIProgressCallback progress_callback;
+    void *progress_userdata;
     int discard;
 };
 
@@ -487,22 +492,42 @@ static enum AmiAPIError body_sink_write(
     if (sink->total > sink->limit || size > sink->limit - sink->total)
         return AMIAPI_ERR_RESPONSE_TOO_LARGE;
 
-    sink->total += size;
-    if (size == 0 || sink->discard)
+    if (size == 0)
         return AMIAPI_OK;
 
-    if (sink->callback)
-        return sink->callback(data, size, sink->userdata);
+    if (sink->discard) {
+        sink->total += size;
+        return AMIAPI_OK;
+    }
 
-    err = append_bytes(
-        &sink->response->body,
-        &sink->response->body_size,
-        &sink->capacity,
-        data,
-        size,
-        sink->limit
-    );
-    return err;
+    if (sink->callback) {
+        err = sink->callback(data, size, sink->userdata);
+    }
+    else {
+        err = append_bytes(
+            &sink->response->body,
+            &sink->response->body_size,
+            &sink->capacity,
+            data,
+            size,
+            sink->limit
+        );
+    }
+
+    if (err != AMIAPI_OK)
+        return err;
+
+    sink->total += size;
+    if (sink->progress_callback &&
+        !sink->progress_callback(
+            sink->total,
+            sink->expected_total,
+            sink->progress_userdata))
+    {
+        return AMIAPI_ERR_CANCELLED;
+    }
+
+    return AMIAPI_OK;
 }
 
 static enum AmiAPIError transfer_encoding_chunked(
@@ -1150,6 +1175,8 @@ static struct AmiAPIResponse *amiapi_get_once(
     if (!sink.discard) {
         sink.callback = api_request->response_callback;
         sink.userdata = api_request->response_userdata;
+        sink.progress_callback = api_request->progress_callback;
+        sink.progress_userdata = api_request->progress_userdata;
     }
 
     err = transfer_encoding_chunked(
@@ -1166,6 +1193,9 @@ static struct AmiAPIResponse *amiapi_get_once(
     );
     if (err != AMIAPI_OK)
         goto fail;
+
+    if (!is_chunked && has_content_length)
+        sink.expected_total = content_length;
 
     /*
      * Transfer-Encoding takes precedence over Content-Length.
@@ -1860,6 +1890,23 @@ enum AmiAPIError AmiAPI_RequestSetResponseCallback(
 
     request->response_callback = callback;
     request->response_userdata = userdata;
+    return AMIAPI_OK;
+}
+
+enum AmiAPIError AmiAPI_RequestSetProgressCallback(
+    struct AmiAPIRequest *request,
+    AmiAPIProgressCallback callback,
+    void *userdata)
+{
+    if (!request ||
+        !request->ctx ||
+        request->ctx->magic != AMIAPI_CONTEXT_MAGIC)
+    {
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+    }
+
+    request->progress_callback = callback;
+    request->progress_userdata = userdata;
     return AMIAPI_OK;
 }
 

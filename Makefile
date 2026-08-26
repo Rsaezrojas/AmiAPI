@@ -33,6 +33,8 @@ BASICGET := $(BUILD)/basicget
 TIMEOUTGET := $(BUILD)/timeoutget
 STREAMGET := $(BUILD)/streamget
 DOWNLOADGET := $(BUILD)/downloadget
+PROGRESSGET := $(BUILD)/progressget
+TEST_ERRORS := $(BUILD)/test_errors
 
 ifeq ($(PLATFORM),posix)
 TRANSPORT_SRC := src/transport_posix.c
@@ -145,14 +147,21 @@ $(STREAMGET): tests/streamget.c $(LIB)
 $(DOWNLOADGET): tests/downloadget.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+$(PROGRESSGET): tests/progressget.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+$(TEST_ERRORS): tests/test_errors.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 test: all
 ifeq ($(PLATFORM),posix)
-	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND) $(AUTHGET) $(BASICGET) $(TIMEOUTGET) $(STREAMGET) $(DOWNLOADGET)
+	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND) $(AUTHGET) $(BASICGET) $(TIMEOUTGET) $(STREAMGET) $(DOWNLOADGET) $(PROGRESSGET) $(TEST_ERRORS)
 	$(HELLO)
 	$(PYTHON) tests/test_http.py
 	$(TEST_JSON)
 	$(TEST_URL)
 	$(TEST_FORM)
+	$(TEST_ERRORS)
 else
 	@echo "Host integration tests are only run with PLATFORM=posix."
 endif

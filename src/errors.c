@@ -18,6 +18,7 @@ const char *AmiAPI_ErrorString(enum AmiAPIError error)
     case AMIAPI_ERR_SOCKET_LIBRARY: return "unable to open bsdsocket.library";
     case AMIAPI_ERR_HTTP_STATUS: return "HTTP response status is not successful";
     case AMIAPI_ERR_FILESYSTEM: return "filesystem operation failed";
+    case AMIAPI_ERR_CANCELLED: return "request cancelled";
     default: return "unknown error";
     }
 }

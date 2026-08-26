@@ -20,6 +20,17 @@ typedef enum AmiAPIError (*AmiAPIBodyCallback)(
     void *userdata
 );
 
+/*
+ * Called after decoded bytes are accepted. received is cumulative; total is
+ * validated Content-Length or zero when unknown. Nonzero continues and zero
+ * cooperatively cancels the request.
+ */
+typedef int (*AmiAPIProgressCallback)(
+    size_t received,
+    size_t total,
+    void *userdata
+);
+
 struct AmiAPIContext *AmiAPI_Create(void);
 void AmiAPI_Destroy(struct AmiAPIContext *);
 const char *AmiAPI_VersionString(void);
@@ -48,6 +59,11 @@ enum AmiAPIError AmiAPI_RequestSetResponseCallback(
     AmiAPIBodyCallback,
     void *
 );
+enum AmiAPIError AmiAPI_RequestSetProgressCallback(
+    struct AmiAPIRequest *,
+    AmiAPIProgressCallback,
+    void *
+);
 enum AmiAPIError AmiAPI_RequestDownloadFile(
     struct AmiAPIRequest *,
     const char *
@@ -66,6 +82,10 @@ void AmiAPI_FreeResponse(struct AmiAPIResponse *);
 int AmiAPI_Status(const struct AmiAPIResponse *);
 const unsigned char *AmiAPI_Body(const struct AmiAPIResponse *);
 size_t AmiAPI_BodySize(const struct AmiAPIResponse *);
+/*
+ * Case-insensitive lookup returns the first occurrence, or NULL. Returned
+ * storage belongs to the response and ends with AmiAPI_FreeResponse().
+ */
 const char *AmiAPI_Header(const struct AmiAPIResponse *, const char *);
 #ifdef __cplusplus
 }
