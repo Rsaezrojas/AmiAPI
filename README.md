@@ -1,16 +1,108 @@
-# AmiAPI M1.1 fix / 0.1.2
+# AmiAPI
 
-Targeted crash fix for classic AmigaOS.
+A small native HTTP/HTTPS and API client library for classic AmigaOS.
 
-The key change is moving the 4096-byte receive buffer out of `AmiAPI_Get()`'s
-stack frame and onto the heap. Classic AmigaDOS processes can have very small
-stacks, so the previous local `unsigned char chunk[4096]` could overflow the
-process stack before the network call and later surface as Exec memory-list
-corruption/Gurus.
+Current version: 0.1.2
 
-Also included: hardened dynamic-buffer accounting with an explicit NUL-byte
-capacity invariant, cleaned diagnostic code, private bsdsocket base, and normal
-response/context cleanup restored.
+## Target
 
-Chunked transfer decoding is not implemented yet; chunked bodies are returned
-raw in this milestone.
+- AmigaOS 3.x
+- 68020+
+- no FPU required
+- no MMU required
+- bsdsocket.library-compatible TCP/IP stack
+- AmiSSL 5 for HTTPS
+
+A stock A1200 with Fast RAM is the reference performance class.
+
+## Current features
+
+- HTTP and HTTPS
+- TLS certificate and hostname verification
+- HTTP redirects
+- Content-Length handling
+- chunked transfer decoding
+- generic HTTP request methods and request bodies
+- custom request headers
+- sensitive-header stripping across cross-origin redirects
+- Basic authentication
+- Bearer authentication
+- URL percent encoding and query construction
+- application/x-www-form-urlencoded helpers
+- JSON parsing and JSON HTTP helpers
+- bounded response buffering
+- configurable network timeout
+- POSIX backend for host-side development and testing
+- native AmigaOS bsdsocket.library/AmiSSL backend
+
+## Network timeout
+
+Each AmiAPI context has a configurable network timeout:
+
+    AmiAPI_SetTimeout(ctx, seconds);
+
+The value can be queried with:
+
+    AmiAPI_Timeout(ctx);
+
+The timeout applies to:
+
+- TCP connection establishment
+- socket reads
+- socket writes
+- TLS handshake I/O
+- TLS reads and writes
+
+A value of zero disables AmiAPI's timeout and allows the underlying
+network operation to wait indefinitely.
+
+DNS resolution is currently performed by the platform resolver before
+TCP connection establishment. Resolver calls may therefore use the
+TCP/IP stack's own DNS timeout and are not bounded by
+AmiAPI_SetTimeout().
+
+## Memory
+
+HTTP response bodies are currently buffered in memory and bounded by
+the context's maximum-body setting. The receive scratch buffer is
+heap-backed to remain safe with the small process stacks commonly used
+on classic AmigaOS.
+
+Streaming and download-to-file support are planned for a later
+milestone.
+
+## Building
+
+POSIX development build:
+
+    make PLATFORM=posix
+
+Run the host-side regression suite:
+
+    make PLATFORM=posix test
+
+Classic AmigaOS cross-build:
+
+    make PLATFORM=amiga
+
+The Amiga build targets 68020 by default.
+
+## Transport architecture
+
+Protocol handling is kept independent of the platform socket API:
+
+    Application
+        |
+      AmiAPI
+        |
+       HTTP
+        |
+  transport interface
+     /         \
+ POSIX       AmigaOS
+ sockets    bsdsocket.library
+               +
+             AmiSSL
+
+This keeps most protocol behaviour testable on the development host
+while retaining a native classic-Amiga transport.
