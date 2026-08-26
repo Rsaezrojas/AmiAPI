@@ -35,6 +35,24 @@ static int set_nonblocking(int fd)
     ) == 0;
 }
 
+static int set_blocking(int fd)
+{
+    int flags;
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+        return 0;
+
+    if ((flags & O_NONBLOCK) == 0)
+        return 1;
+
+    return fcntl(
+        fd,
+        F_SETFL,
+        flags & ~O_NONBLOCK
+    ) == 0;
+}
+
 static int wait_for_socket(
     int fd,
     int want_read,
@@ -180,6 +198,10 @@ enum AmiAPIError amiapi_transport_connect(struct AmiAPITransport *transport,
         return AMIAPI_ERR_DNS;
 
     for (it = result; it != NULL; it = it->ai_next) {
+        int connected;
+        int connect_error;
+        socklen_t connect_error_size;
+
         transport->fd = socket(
             it->ai_family,
             it->ai_socktype,
@@ -189,13 +211,55 @@ enum AmiAPIError amiapi_transport_connect(struct AmiAPITransport *transport,
         if (transport->fd < 0)
             continue;
 
-        if (connect(
-                transport->fd,
-                it->ai_addr,
-                it->ai_addrlen
-            ) == 0)
+        if (!set_nonblocking(transport->fd)) {
+            close(transport->fd);
+            transport->fd = -1;
+            continue;
+        }
+
+        connected = 0;
+
+        rc = connect(
+            transport->fd,
+            it->ai_addr,
+            it->ai_addrlen
+        );
+
+        if (rc == 0) {
+            connected = 1;
+        }
+        else if (errno == EINPROGRESS ||
+                 errno == EWOULDBLOCK)
         {
+            if (wait_for_socket(
+                    transport->fd,
+                    0,
+                    transport->timeout_seconds))
+            {
+                connect_error = 0;
+                connect_error_size = sizeof(connect_error);
+
+                if (getsockopt(
+                        transport->fd,
+                        SOL_SOCKET,
+                        SO_ERROR,
+                        &connect_error,
+                        &connect_error_size) == 0 &&
+                    connect_error == 0)
+                {
+                    connected = 1;
+                }
+            }
+        }
+
+        if (connected) {
             enum AmiAPIError timeout_err;
+
+            if (!set_blocking(transport->fd)) {
+                close(transport->fd);
+                transport->fd = -1;
+                continue;
+            }
 
             timeout_err = apply_socket_timeouts(
                 transport

@@ -341,15 +341,13 @@ enum AmiAPIError amiapi_transport_connect(
     if (fd < 0)
         return AMIAPI_ERR_CONNECT;
 
-    if (connect(
-            fd,
-            (struct sockaddr *)&a,
-            sizeof(a)) < 0)
-    {
-        CloseSocket(fd);
-        return AMIAPI_ERR_CONNECT;
-    }
-
+    /*
+     * A blocking connect() can otherwise stall for the TCP stack's
+     * own timeout, ignoring AmiAPI's configured request timeout.
+     *
+     * Put the socket into nonblocking mode before connect(), then
+     * use WaitSelect() to enforce the AmiAPI timeout.
+     */
     t->fd = fd;
 
     e = set_socket_nonblocking(t);
@@ -357,6 +355,62 @@ enum AmiAPIError amiapi_transport_connect(
         CloseSocket(fd);
         t->fd = -1;
         return e;
+    }
+
+    if (connect(
+            fd,
+            (struct sockaddr *)&a,
+            sizeof(a)) < 0)
+    {
+        LONG error;
+
+        error = Errno();
+
+        if (error != EINPROGRESS &&
+            error != EWOULDBLOCK &&
+            error != EAGAIN &&
+            error != EALREADY)
+        {
+            CloseSocket(fd);
+            t->fd = -1;
+            return AMIAPI_ERR_CONNECT;
+        }
+
+        /*
+         * A nonblocking connect completes by making the socket
+         * writable.  Writability alone does not mean success:
+         * SO_ERROR must be checked afterwards.
+         */
+        if (wait_socket_ready(
+                t,
+                0,
+                1) <= 0)
+        {
+            CloseSocket(fd);
+            t->fd = -1;
+            return AMIAPI_ERR_CONNECT;
+        }
+
+        {
+            LONG socket_error;
+            socklen_t socket_error_size;
+
+            socket_error = 0;
+            socket_error_size = sizeof(socket_error);
+
+            if (getsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    &socket_error,
+                    &socket_error_size) != 0 ||
+                socket_error != 0)
+            {
+                CloseSocket(fd);
+                t->fd = -1;
+                return AMIAPI_ERR_CONNECT;
+            }
+        }
     }
 
     return AMIAPI_OK;
