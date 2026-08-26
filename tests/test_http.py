@@ -475,6 +475,156 @@ def test_https_chunked():
     print("HTTPS chunked transfer test: OK")
 
 
+STREAM_BODY = b"stream\x00binary\xffbody"
+LARGE_STREAM_BODY = bytes(range(256)) * 40
+
+
+class StreamingHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "99")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/length":
+            body = STREAM_BODY
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Stream-Test", "length")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/large":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(LARGE_STREAM_BODY)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(LARGE_STREAM_BODY)
+        elif self.path == "/chunked":
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for part in (STREAM_BODY[:4], STREAM_BODY[4:11], STREAM_BODY[11:]):
+                self.wfile.write(f"{len(part):x};test=yes\r\n".encode())
+                self.wfile.write(part + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\nX-Trailer: hidden\r\n\r\n")
+        elif self.path == "/eof":
+            self.send_response(200)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(STREAM_BODY)
+        elif self.path == "/redirect":
+            body = b"NEVER"
+            self.send_response(302)
+            self.send_header("Location", "/length")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def run_streamget(method, url, max_body=None, fail_call=None, env=None):
+    command = ["./build/streamget", method, url]
+    if max_body is not None:
+        command.append(str(max_body))
+    if fail_call is not None:
+        command.append(str(fail_call))
+    return subprocess.run(
+        command, text=True, capture_output=True, timeout=15, env=env
+    )
+
+
+def assert_stream(result, body, label, multiple=False):
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{label} unexpectedly failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert result.stdout.startswith(body.hex() + "\n"), result.stdout
+    assert f"callback-bytes: {len(body)}" in result.stdout, result.stdout
+    assert "response-body-null: 1" in result.stdout, result.stdout
+    assert "response-body-size: 0" in result.stdout, result.stdout
+    if multiple:
+        calls = int(result.stdout.split("callback-calls: ", 1)[1].splitlines()[0])
+        assert calls > 1, result.stdout
+
+
+def test_streaming_responses():
+    with TestServer(("127.0.0.1", 0), StreamingHandler) as server:
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            assert_stream(run_streamget("GET", base + "/length"), STREAM_BODY,
+                          "Content-Length stream")
+            length = run_streamget("GET", base + "/length")
+            assert "HTTP 200" in length.stdout, length.stdout
+            assert "x-stream-test: length" in length.stdout, length.stdout
+            assert_stream(run_streamget("GET", base + "/chunked"), STREAM_BODY,
+                          "chunked stream")
+            assert_stream(run_streamget("GET", base + "/eof"), STREAM_BODY,
+                          "EOF stream")
+            assert_stream(run_streamget("GET", base + "/large"), LARGE_STREAM_BODY,
+                          "large stream", multiple=True)
+            assert_stream(run_streamget("GET", base + "/redirect"), STREAM_BODY,
+                          "redirect stream")
+
+            head = run_streamget("HEAD", base + "/length")
+            assert_stream(head, b"", "HEAD stream")
+            assert "callback-calls: 0" in head.stdout, head.stdout
+
+            failed = run_streamget("GET", base + "/length",
+                                   AMIAPI_DEFAULT_MAX_BODY_PY, 1)
+            assert failed.returncode == 20, failed.stdout + failed.stderr
+            assert "error: 3" in failed.stderr, failed.stderr
+
+            oversized = run_streamget("GET", base + "/length", 4)
+            assert oversized.returncode == 20, oversized.stdout + oversized.stderr
+            assert "error: 11" in oversized.stderr, oversized.stderr
+        finally:
+            server.shutdown()
+            thread.join()
+
+    print("Streaming response tests: OK")
+
+
+AMIAPI_DEFAULT_MAX_BODY_PY = 1024 * 1024
+
+
+def test_https_streaming():
+    with tempfile.TemporaryDirectory(prefix="amiapi-https-stream-") as tmp:
+        ca_cert, server_cert, server_key = make_certificates(tmp)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=server_cert, keyfile=server_key)
+        with TestServer(("127.0.0.1", 0), StreamingHandler) as server:
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            env = os.environ.copy()
+            env["SSL_CERT_FILE"] = str(ca_cert)
+            try:
+                result = run_streamget(
+                    "GET", f"https://localhost:{port}/chunked", env=env
+                )
+            finally:
+                server.shutdown()
+                thread.join()
+    assert_stream(result, STREAM_BODY, "HTTPS stream")
+    print("HTTPS streaming response test: OK")
+
+
 class RedirectHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2110,6 +2260,8 @@ def main():
     test_content_length_framing()
     test_chunked_transfer()
     test_https_chunked()
+    test_streaming_responses()
+    test_https_streaming()
     test_redirects()
     test_http_to_https_redirect()
 

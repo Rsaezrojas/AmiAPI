@@ -25,6 +25,8 @@ struct AmiAPIRequest {
     size_t header_count;
     unsigned char *body;
     size_t body_size;
+    AmiAPIBodyCallback response_callback;
+    void *response_userdata;
 };
 
 struct AmiAPIResponse {
@@ -457,6 +459,47 @@ struct AmiAPIBodyReader {
     size_t scratch_pos;
 };
 
+struct AmiAPIBodySink {
+    struct AmiAPIResponse *response;
+    AmiAPIBodyCallback callback;
+    void *userdata;
+    size_t total;
+    size_t capacity;
+    size_t limit;
+    int discard;
+};
+
+static enum AmiAPIError body_sink_write(
+    struct AmiAPIBodySink *sink,
+    const unsigned char *data,
+    size_t size)
+{
+    enum AmiAPIError err;
+
+    if (!sink || (!data && size != 0))
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+
+    if (sink->total > sink->limit || size > sink->limit - sink->total)
+        return AMIAPI_ERR_RESPONSE_TOO_LARGE;
+
+    sink->total += size;
+    if (size == 0 || sink->discard)
+        return AMIAPI_OK;
+
+    if (sink->callback)
+        return sink->callback(data, size, sink->userdata);
+
+    err = append_bytes(
+        &sink->response->body,
+        &sink->response->body_size,
+        &sink->capacity,
+        data,
+        size,
+        sink->limit
+    );
+    return err;
+}
+
 static enum AmiAPIError transfer_encoding_chunked(
     const struct AmiAPIResponse *response,
     int *chunked)
@@ -645,10 +688,8 @@ static enum AmiAPIError parse_chunk_size(
 
 static enum AmiAPIError body_reader_append(
     struct AmiAPIBodyReader *reader,
-    struct AmiAPIResponse *response,
-    size_t *body_capacity,
-    size_t amount,
-    size_t limit)
+    struct AmiAPIBodySink *sink,
+    size_t amount)
 {
     enum AmiAPIError err;
 
@@ -662,14 +703,7 @@ static enum AmiAPIError body_reader_append(
             available = reader->initial_size - reader->initial_pos;
             take = available < amount ? available : amount;
 
-            err = append_bytes(
-                &response->body,
-                &response->body_size,
-                body_capacity,
-                source,
-                take,
-                limit
-            );
+            err = body_sink_write(sink, source, take);
             if (err != AMIAPI_OK)
                 return err;
 
@@ -688,14 +722,7 @@ static enum AmiAPIError body_reader_append(
         available = reader->scratch_size - reader->scratch_pos;
         take = available < amount ? available : amount;
 
-        err = append_bytes(
-            &response->body,
-            &response->body_size,
-            body_capacity,
-            source,
-            take,
-            limit
-        );
+        err = body_sink_write(sink, source, take);
         if (err != AMIAPI_OK)
             return err;
 
@@ -728,13 +755,11 @@ static enum AmiAPIError body_reader_expect_crlf(
 
 static enum AmiAPIError decode_chunked_body(
     struct AmiAPITransport *transport,
-    struct AmiAPIResponse *response,
+    struct AmiAPIBodySink *sink,
     const unsigned char *initial,
     size_t initial_size,
     unsigned char *scratch,
-    size_t scratch_capacity,
-    size_t *body_capacity,
-    size_t max_body)
+    size_t scratch_capacity)
 {
     struct AmiAPIBodyReader reader;
     char *line;
@@ -772,19 +797,10 @@ static enum AmiAPIError decode_chunked_body(
         if (chunk_size == 0)
             break;
 
-        if (response->body_size > max_body ||
-            chunk_size > max_body - response->body_size)
-        {
-            err = AMIAPI_ERR_RESPONSE_TOO_LARGE;
-            goto done;
-        }
-
         err = body_reader_append(
             &reader,
-            response,
-            body_capacity,
-            chunk_size,
-            max_body
+            sink,
+            chunk_size
         );
         if (err != AMIAPI_OK)
             goto done;
@@ -873,6 +889,8 @@ static int urls_same_origin(
     return same;
 }
 
+static int is_redirect_status(int status);
+
 static struct AmiAPIResponse *amiapi_get_once(
     struct AmiAPIRequest *api_request,
     const char *url,
@@ -887,12 +905,13 @@ static struct AmiAPIResponse *amiapi_get_once(
     struct AmiAPIResponse *response = NULL;
     enum AmiAPIError err;
     char *request = NULL, *header_copy = NULL;
-    size_t request_size, raw_used = 0, raw_capacity = 0, header_size, initial_body, body_capacity = 0;
+    size_t request_size, raw_used = 0, raw_capacity = 0, header_size, initial_body;
     size_t content_length = 0;
     int has_content_length = 0;
     int is_chunked = 0;
     unsigned char *chunk = NULL, *raw = NULL, *header_end = NULL;
     long n = 0;
+    struct AmiAPIBodySink sink;
 
     ctx = api_request ? api_request->ctx : NULL;
 
@@ -1119,6 +1138,15 @@ static struct AmiAPIResponse *amiapi_get_once(
         return response;
     }
 
+    memset(&sink, 0, sizeof(sink));
+    sink.response = response;
+    sink.limit = ctx->max_body;
+    sink.discard = is_redirect_status(response->status);
+    if (!sink.discard) {
+        sink.callback = api_request->response_callback;
+        sink.userdata = api_request->response_userdata;
+    }
+
     err = transfer_encoding_chunked(
         response,
         &is_chunked
@@ -1142,13 +1170,11 @@ static struct AmiAPIResponse *amiapi_get_once(
     if (is_chunked) {
         err = decode_chunked_body(
             &transport,
-            response,
+            &sink,
             raw + header_size,
             initial_body,
             chunk,
-            AMIAPI_READ_CHUNK,
-            &body_capacity,
-            ctx->max_body
+            AMIAPI_READ_CHUNK
         );
 
         if (err != AMIAPI_OK)
@@ -1178,14 +1204,7 @@ static struct AmiAPIResponse *amiapi_get_once(
         if (has_content_length && initial_body > content_length)
             initial_body = content_length;
 
-        err = append_bytes(
-            &response->body,
-            &response->body_size,
-            &body_capacity,
-            raw + header_size,
-            initial_body,
-            ctx->max_body
-        );
+        err = body_sink_write(&sink, raw + header_size, initial_body);
         if (err != AMIAPI_OK)
             goto fail;
 
@@ -1194,11 +1213,11 @@ static struct AmiAPIResponse *amiapi_get_once(
         raw_used = raw_capacity = 0;
 
         if (has_content_length) {
-            while (response->body_size < content_length) {
+            while (sink.total < content_length) {
                 size_t remaining;
                 size_t request_amount;
 
-                remaining = content_length - response->body_size;
+                remaining = content_length - sink.total;
                 request_amount = remaining < AMIAPI_READ_CHUNK
                     ? remaining
                     : AMIAPI_READ_CHUNK;
@@ -1219,14 +1238,7 @@ static struct AmiAPIResponse *amiapi_get_once(
                     goto fail;
                 }
 
-                err = append_bytes(
-                    &response->body,
-                    &response->body_size,
-                    &body_capacity,
-                    chunk,
-                    (size_t)n,
-                    ctx->max_body
-                );
+                err = body_sink_write(&sink, chunk, (size_t)n);
                 if (err != AMIAPI_OK)
                     goto fail;
             }
@@ -1237,14 +1249,7 @@ static struct AmiAPIResponse *amiapi_get_once(
                         chunk,
                         AMIAPI_READ_CHUNK)) > 0)
             {
-                err = append_bytes(
-                    &response->body,
-                    &response->body_size,
-                    &body_capacity,
-                    chunk,
-                    (size_t)n,
-                    ctx->max_body
-                );
+                err = body_sink_write(&sink, chunk, (size_t)n);
                 if (err != AMIAPI_OK)
                     goto fail;
             }
@@ -1833,6 +1838,23 @@ enum AmiAPIError AmiAPI_RequestSetBody(
     request->body = copy;
     request->body_size = size;
 
+    return AMIAPI_OK;
+}
+
+enum AmiAPIError AmiAPI_RequestSetResponseCallback(
+    struct AmiAPIRequest *request,
+    AmiAPIBodyCallback callback,
+    void *userdata)
+{
+    if (!request ||
+        !request->ctx ||
+        request->ctx->magic != AMIAPI_CONTEXT_MAGIC)
+    {
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+    }
+
+    request->response_callback = callback;
+    request->response_userdata = userdata;
     return AMIAPI_OK;
 }
 

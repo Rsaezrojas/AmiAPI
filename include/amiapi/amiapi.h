@@ -14,6 +14,12 @@ struct AmiAPIContext;
 struct AmiAPIRequest;
 struct AmiAPIResponse;
 
+typedef enum AmiAPIError (*AmiAPIBodyCallback)(
+    const void *data,
+    size_t size,
+    void *userdata
+);
+
 struct AmiAPIContext *AmiAPI_Create(void);
 void AmiAPI_Destroy(struct AmiAPIContext *);
 const char *AmiAPI_VersionString(void);
@@ -36,6 +42,11 @@ enum AmiAPIError AmiAPI_RequestSetBody(
     struct AmiAPIRequest *,
     const void *,
     size_t
+);
+enum AmiAPIError AmiAPI_RequestSetResponseCallback(
+    struct AmiAPIRequest *,
+    AmiAPIBodyCallback,
+    void *
 );
 void AmiAPI_RequestClearHeaders(struct AmiAPIRequest *);
 struct AmiAPIResponse *AmiAPI_RequestExecute(struct AmiAPIRequest *);

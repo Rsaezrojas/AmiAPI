@@ -31,6 +31,7 @@ FORMSEND := $(BUILD)/formsend
 AUTHGET := $(BUILD)/authget
 BASICGET := $(BUILD)/basicget
 TIMEOUTGET := $(BUILD)/timeoutget
+STREAMGET := $(BUILD)/streamget
 
 ifeq ($(PLATFORM),posix)
 TRANSPORT_SRC := src/transport_posix.c
@@ -130,9 +131,12 @@ $(BASICGET): tests/basicget.c $(LIB)
 $(TIMEOUTGET): tests/timeoutget.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+$(STREAMGET): tests/streamget.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 test: all
 ifeq ($(PLATFORM),posix)
-	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND) $(AUTHGET) $(BASICGET) $(TIMEOUTGET)
+	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND) $(AUTHGET) $(BASICGET) $(TIMEOUTGET) $(STREAMGET)
 	$(HELLO)
 	$(PYTHON) tests/test_http.py
 	$(TEST_JSON)
