@@ -8,6 +8,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 
@@ -1927,7 +1928,165 @@ def test_basic_auth_cross_origin_redirect():
     print("Basic cross-origin redirect test: OK")
 
 
+class SlowResponseHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        # Deliberately exceed the client's one-second receive timeout.
+        time.sleep(3.0)
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def test_receive_timeout():
+    with TestServer(("127.0.0.1", 0), SlowResponseHandler) as server:
+        port = server.server_address[1]
+
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        started = time.monotonic()
+
+        try:
+            result = subprocess.run(
+                [
+                    "./build/timeoutget",
+                    f"http://127.0.0.1:{port}/slow",
+                    "1",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=4,
+            )
+
+            elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            thread.join()
+
+    if result.returncode != 20:
+        raise AssertionError(
+            "slow response did not trigger AmiAPI timeout\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    if "receive failed" not in result.stderr:
+        raise AssertionError(
+            "slow response produced unexpected AmiAPI error\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    # It must fail well before the server's deliberate 3-second delay.
+    if elapsed >= 2.5:
+        raise AssertionError(
+            f"receive timeout took too long: {elapsed:.3f}s"
+        )
+
+    if elapsed < 0.5:
+        raise AssertionError(
+            f"receive timeout fired implausibly early: {elapsed:.3f}s"
+        )
+
+    print("HTTP receive timeout test: OK")
+
+
+def test_https_receive_timeout():
+    with tempfile.TemporaryDirectory(
+        prefix="amiapi-https-timeout-"
+    ) as tmp:
+        ca_cert, server_cert, server_key = make_certificates(tmp)
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(
+            certfile=server_cert,
+            keyfile=server_key,
+        )
+
+        with TestServer(
+            ("127.0.0.1", 0),
+            SlowResponseHandler,
+        ) as server:
+            server.socket = context.wrap_socket(
+                server.socket,
+                server_side=True,
+            )
+
+            port = server.server_address[1]
+
+            thread = threading.Thread(
+                target=server.serve_forever,
+                daemon=True,
+            )
+            thread.start()
+
+            env = os.environ.copy()
+            env["SSL_CERT_FILE"] = str(ca_cert)
+
+            started = time.monotonic()
+
+            try:
+                result = subprocess.run(
+                    [
+                        "./build/timeoutget",
+                        f"https://localhost:{port}/slow",
+                        "1",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=4,
+                    env=env,
+                )
+
+                elapsed = time.monotonic() - started
+            finally:
+                server.shutdown()
+                thread.join()
+
+    if result.returncode != 20:
+        raise AssertionError(
+            "slow HTTPS response did not trigger AmiAPI timeout\n"
+            f"exit={result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    if "receive failed" not in result.stderr:
+        raise AssertionError(
+            "slow HTTPS response produced unexpected AmiAPI error\n"
+            f"stderr:\n{result.stderr}"
+        )
+
+    if elapsed >= 2.5:
+        raise AssertionError(
+            f"HTTPS receive timeout took too long: {elapsed:.3f}s"
+        )
+
+    if elapsed < 0.5:
+        raise AssertionError(
+            f"HTTPS receive timeout fired implausibly early: "
+            f"{elapsed:.3f}s"
+        )
+
+    print("HTTPS receive timeout test: OK")
+
+
 def main():
+    test_receive_timeout()
+    test_https_receive_timeout()
     test_basic_auth_helper()
     test_basic_auth_edge_cases()
     test_basic_auth_invalid_credentials()

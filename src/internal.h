@@ -2,7 +2,12 @@
 #define AMIAPI_INTERNAL_H
 #include <stddef.h>
 #include <amiapi/errors.h>
-struct AmiAPIContext { unsigned long magic; size_t max_body; enum AmiAPIError last_error; };
+struct AmiAPIContext {
+    unsigned long magic;
+    size_t max_body;
+    unsigned int timeout_seconds;
+    enum AmiAPIError last_error;
+};
 #define AMIAPI_CONTEXT_MAGIC 0x41415049UL
 void amiapi_set_error(struct AmiAPIContext *, enum AmiAPIError);
 struct AmiAPITransport {
@@ -10,6 +15,7 @@ struct AmiAPITransport {
     void *tls_ctx;
     void *tls_ssl;
     int use_tls;
+    unsigned int timeout_seconds;
 };
 enum AmiAPIError amiapi_transport_connect(struct AmiAPITransport *, const char *, unsigned short);
 enum AmiAPIError amiapi_transport_prepare_tls(void);

@@ -24,6 +24,7 @@ static struct Library *AmiAPISocketBase = NULL;
 
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/filio.h>
 #include <netinet/in.h>
 
 #include <openssl/ssl.h>
@@ -180,6 +181,126 @@ enum AmiAPIError amiapi_transport_prepare_tls(void)
     return open_amissl();
 }
 
+static int wait_socket_ready(
+    struct AmiAPITransport *t,
+    int want_read,
+    int want_write)
+{
+    fd_set read_fds;
+    fd_set write_fds;
+    struct __timeval timeout;
+    struct __timeval *timeout_ptr;
+    LONG rc;
+
+    if (!t || t->fd < 0)
+        return -1;
+
+    FD_ZERO(&read_fds);
+    FD_ZERO(&write_fds);
+
+    if (want_read)
+        FD_SET(t->fd, &read_fds);
+
+    if (want_write)
+        FD_SET(t->fd, &write_fds);
+
+    if (t->timeout_seconds != 0) {
+        timeout.tv_sec = (LONG)t->timeout_seconds;
+        timeout.tv_usec = 0;
+        timeout_ptr = &timeout;
+    }
+    else {
+        timeout_ptr = NULL;
+    }
+
+    rc = WaitSelect(
+        t->fd + 1,
+        want_read ? (APTR)&read_fds : NULL,
+        want_write ? (APTR)&write_fds : NULL,
+        NULL,
+        timeout_ptr,
+        NULL
+    );
+
+    if (rc < 0)
+        return -1;
+
+    if (rc == 0)
+        return 0;
+
+    return 1;
+}
+
+
+static int socket_would_block(void)
+{
+    LONG error;
+
+    error = Errno();
+
+#ifdef EWOULDBLOCK
+    if (error == EWOULDBLOCK)
+        return 1;
+#endif
+
+#ifdef EAGAIN
+    if (error == EAGAIN)
+        return 1;
+#endif
+
+    return 0;
+}
+
+
+static int wait_for_ssl(
+    struct AmiAPITransport *t,
+    int ssl_error)
+{
+    if (!t)
+        return -1;
+
+    if (ssl_error == SSL_ERROR_WANT_READ) {
+        return wait_socket_ready(
+            t,
+            1,
+            0
+        );
+    }
+
+    if (ssl_error == SSL_ERROR_WANT_WRITE) {
+        return wait_socket_ready(
+            t,
+            0,
+            1
+        );
+    }
+
+    return -1;
+}
+
+
+static enum AmiAPIError set_socket_nonblocking(
+    struct AmiAPITransport *t)
+{
+    LONG enabled;
+
+    if (!t || t->fd < 0)
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+
+    enabled = 1;
+
+    if (IoctlSocket(
+            t->fd,
+            FIONBIO,
+            &enabled) != 0)
+    {
+        return AMIAPI_ERR_CONNECT;
+    }
+
+    return AMIAPI_OK;
+}
+
+
 enum AmiAPIError amiapi_transport_connect(
     struct AmiAPITransport *t,
     const char *host,
@@ -230,6 +351,14 @@ enum AmiAPIError amiapi_transport_connect(
     }
 
     t->fd = fd;
+
+    e = set_socket_nonblocking(t);
+    if (e != AMIAPI_OK) {
+        CloseSocket(fd);
+        t->fd = -1;
+        return e;
+    }
+
     return AMIAPI_OK;
 }
 
@@ -291,21 +420,42 @@ enum AmiAPIError amiapi_transport_start_tls(
 
     TLS_DEBUG("TLS: SSL_connect\n");
 
-    rc = SSL_connect(ssl);
+    for (;;) {
+        int ssl_err;
+        int ready;
 
-    TLS_DEBUG("TLS: SSL_connect rc=%d\n", rc);
+        rc = SSL_connect(ssl);
 
-    if (rc != 1) {
-        int ssl_err = SSL_get_error(ssl, rc);
-        unsigned long e = ERR_get_error();
+        TLS_DEBUG("TLS: SSL_connect rc=%d\n", rc);
 
-        printf(
-            "TLS: handshake failed "
-            "SSL_get_error=%d ERR=%08lx errno=%d\n",
-            ssl_err,
-            e,
-            errno
-        );
+        if (rc == 1)
+            break;
+
+        ssl_err = SSL_get_error(ssl, rc);
+
+        if (ssl_err == SSL_ERROR_WANT_READ ||
+            ssl_err == SSL_ERROR_WANT_WRITE)
+        {
+            ready = wait_for_ssl(
+                t,
+                ssl_err
+            );
+
+            if (ready > 0)
+                continue;
+        }
+
+        {
+            unsigned long e = ERR_get_error();
+
+            printf(
+                "TLS: handshake failed "
+                "SSL_get_error=%d ERR=%08lx errno=%d\n",
+                ssl_err,
+                e,
+                errno
+            );
+        }
 
         goto fail;
     }
@@ -363,7 +513,17 @@ enum AmiAPIError amiapi_transport_send_all(
 
             if (ssl_err == SSL_ERROR_WANT_READ ||
                 ssl_err == SSL_ERROR_WANT_WRITE)
-                continue;
+            {
+                int ready;
+
+                ready = wait_for_ssl(
+                    t,
+                    ssl_err
+                );
+
+                if (ready > 0)
+                    continue;
+            }
 
             {
                 unsigned long errcode = ERR_get_error();
@@ -384,6 +544,16 @@ enum AmiAPIError amiapi_transport_send_all(
         }
         else {
             long n;
+            int ready;
+
+            ready = wait_socket_ready(
+                t,
+                0,
+                1
+            );
+
+            if (ready <= 0)
+                return AMIAPI_ERR_CONNECT;
 
             /*
              * bsdsocket's prototype is not const-correct on this SDK.
@@ -395,7 +565,14 @@ enum AmiAPIError amiapi_transport_send_all(
                 0
             );
 
-            if (n <= 0)
+            if (n < 0) {
+                if (socket_would_block())
+                    continue;
+
+                return AMIAPI_ERR_CONNECT;
+            }
+
+            if (n == 0)
                 return AMIAPI_ERR_CONNECT;
 
             done += (size_t)n;
@@ -436,32 +613,47 @@ long amiapi_transport_receive(
 
             if (ssl_err == SSL_ERROR_WANT_READ ||
                 ssl_err == SSL_ERROR_WANT_WRITE)
-                continue;
-
-            /*
-             * Keep this diagnostic while HTTPS is being qualified.
-             * It tells us whether a remaining failure is TLS or socket I/O.
-             */
             {
-                unsigned long errcode = ERR_get_error();
+                int ready;
 
-                fprintf(
-                    stderr,
-                    "AmiAPI TLS read failed: "
-                    "SSL_read=%d SSL_get_error=%d "
-                    "ERR=%08lx errno=%d\n",
-                    n,
-                    ssl_err,
-                    errcode,
-                    errno
+                ready = wait_for_ssl(
+                    t,
+                    ssl_err
                 );
+
+                if (ready > 0)
+                    continue;
             }
 
             return -1;
         }
     }
 
-    return recv(t->fd, buf, size, 0);
+    for (;;) {
+        int ready;
+        long n;
+
+        ready = wait_socket_ready(
+            t,
+            1,
+            0
+        );
+
+        if (ready <= 0)
+            return -1;
+
+        n = recv(
+            t->fd,
+            buf,
+            size,
+            0
+        );
+
+        if (n < 0 && socket_would_block())
+            continue;
+
+        return n;
+    }
 }
 
 void amiapi_transport_close(struct AmiAPITransport *t)

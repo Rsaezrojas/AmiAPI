@@ -1,9 +1,13 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <netdb.h>
 #include <unistd.h>
 
@@ -12,6 +16,127 @@
 #include <openssl/x509v3.h>
 
 #include "internal.h"
+
+static int set_nonblocking(int fd)
+{
+    int flags;
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+        return 0;
+
+    if ((flags & O_NONBLOCK) != 0)
+        return 1;
+
+    return fcntl(
+        fd,
+        F_SETFL,
+        flags | O_NONBLOCK
+    ) == 0;
+}
+
+static int wait_for_socket(
+    int fd,
+    int want_read,
+    unsigned int timeout_seconds)
+{
+    struct pollfd pfd;
+    int timeout_ms;
+    int rc;
+
+    if (fd < 0)
+        return 0;
+
+    pfd.fd = fd;
+    pfd.events = want_read ? POLLIN : POLLOUT;
+    pfd.revents = 0;
+
+    if (timeout_seconds == 0) {
+        timeout_ms = -1;
+    }
+    else if (timeout_seconds >
+             (unsigned int)(INT_MAX / 1000)) {
+        timeout_ms = INT_MAX;
+    }
+    else {
+        timeout_ms = (int)timeout_seconds * 1000;
+    }
+
+    do {
+        rc = poll(&pfd, 1, timeout_ms);
+    } while (rc < 0 && errno == EINTR);
+
+    if (rc <= 0)
+        return 0;
+
+    if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+        return 0;
+
+    return (pfd.revents & pfd.events) != 0;
+}
+
+static int wait_for_ssl(
+    struct AmiAPITransport *transport,
+    int ssl_error)
+{
+    if (!transport)
+        return 0;
+
+    if (ssl_error == SSL_ERROR_WANT_READ) {
+        return wait_for_socket(
+            transport->fd,
+            1,
+            transport->timeout_seconds
+        );
+    }
+
+    if (ssl_error == SSL_ERROR_WANT_WRITE) {
+        return wait_for_socket(
+            transport->fd,
+            0,
+            transport->timeout_seconds
+        );
+    }
+
+    return 0;
+}
+
+static enum AmiAPIError apply_socket_timeouts(
+    struct AmiAPITransport *transport)
+{
+    struct timeval timeout;
+
+    if (!transport || transport->fd < 0)
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+
+    if (transport->timeout_seconds == 0)
+        return AMIAPI_OK;
+
+    timeout.tv_sec = (long)transport->timeout_seconds;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(
+            transport->fd,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout,
+            sizeof(timeout)) != 0)
+    {
+        return AMIAPI_ERR_CONNECT;
+    }
+
+    if (setsockopt(
+            transport->fd,
+            SOL_SOCKET,
+            SO_SNDTIMEO,
+            &timeout,
+            sizeof(timeout)) != 0)
+    {
+        return AMIAPI_ERR_CONNECT;
+    }
+
+    return AMIAPI_OK;
+}
 
 enum AmiAPIError amiapi_transport_prepare_tls(void)
 {
@@ -69,7 +194,16 @@ enum AmiAPIError amiapi_transport_connect(struct AmiAPITransport *transport,
                 it->ai_addr,
                 it->ai_addrlen
             ) == 0)
-            break;
+        {
+            enum AmiAPIError timeout_err;
+
+            timeout_err = apply_socket_timeouts(
+                transport
+            );
+
+            if (timeout_err == AMIAPI_OK)
+                break;
+        }
 
         close(transport->fd);
         transport->fd = -1;
@@ -145,8 +279,27 @@ enum AmiAPIError amiapi_transport_start_tls(
     if (SSL_set_fd(ssl, transport->fd) != 1)
         goto fail;
 
-    if (SSL_connect(ssl) != 1)
+    if (!set_nonblocking(transport->fd))
         goto fail;
+
+    for (;;) {
+        int n;
+        int ssl_error;
+
+        n = SSL_connect(ssl);
+
+        if (n == 1)
+            break;
+
+        ssl_error = SSL_get_error(ssl, n);
+
+        if (!wait_for_ssl(
+                transport,
+                ssl_error))
+        {
+            goto fail;
+        }
+    }
 
     if (SSL_get_verify_result(ssl) != X509_V_OK)
         goto fail;
@@ -190,7 +343,11 @@ enum AmiAPIError amiapi_transport_send_all(struct AmiAPITransport *transport,
                 ? INT_MAX
                 : (int)(size - done);
 
-            n = SSL_write(ssl, p + done, amount);
+            n = SSL_write(
+                ssl,
+                p + done,
+                amount
+            );
 
             if (n > 0) {
                 done += (size_t)n;
@@ -199,9 +356,12 @@ enum AmiAPIError amiapi_transport_send_all(struct AmiAPITransport *transport,
 
             ssl_error = SSL_get_error(ssl, n);
 
-            if (ssl_error == SSL_ERROR_WANT_READ ||
-                ssl_error == SSL_ERROR_WANT_WRITE)
+            if (wait_for_ssl(
+                    transport,
+                    ssl_error))
+            {
                 continue;
+            }
 
             return AMIAPI_ERR_SEND;
         }
@@ -243,8 +403,6 @@ long amiapi_transport_receive(struct AmiAPITransport *transport,
     if (transport->use_tls) {
         SSL *ssl = (SSL *)transport->tls_ssl;
         int amount;
-        int n;
-        int ssl_error;
 
         if (ssl == NULL)
             return -1;
@@ -254,7 +412,14 @@ long amiapi_transport_receive(struct AmiAPITransport *transport,
             : (int)size;
 
         for (;;) {
-            n = SSL_read(ssl, buffer, amount);
+            int n;
+            int ssl_error;
+
+            n = SSL_read(
+                ssl,
+                buffer,
+                amount
+            );
 
             if (n > 0)
                 return (long)n;
@@ -264,11 +429,12 @@ long amiapi_transport_receive(struct AmiAPITransport *transport,
             if (ssl_error == SSL_ERROR_ZERO_RETURN)
                 return 0;
 
-            if (ssl_error == SSL_ERROR_WANT_READ ||
-                ssl_error == SSL_ERROR_WANT_WRITE)
-                continue;
-
-            return -1;
+            if (!wait_for_ssl(
+                    transport,
+                    ssl_error))
+            {
+                return -1;
+            }
         }
     }
     else {

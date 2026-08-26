@@ -8,6 +8,7 @@ struct AmiAPIContext *AmiAPI_Create(void)
     if (!ctx) return NULL;
     ctx->magic = AMIAPI_CONTEXT_MAGIC;
     ctx->max_body = (size_t)AMIAPI_DEFAULT_MAX_BODY;
+    ctx->timeout_seconds = AMIAPI_DEFAULT_TIMEOUT_SECONDS;
     ctx->last_error = AMIAPI_OK;
     amiapi_context_count++;
     return ctx;
@@ -22,6 +23,24 @@ void AmiAPI_Destroy(struct AmiAPIContext *ctx)
 const char *AmiAPI_VersionString(void) { return "0.1.2"; }
 void AmiAPI_SetMaxBody(struct AmiAPIContext *ctx, size_t n)
 { if (ctx && ctx->magic == AMIAPI_CONTEXT_MAGIC) ctx->max_body = n; }
+
+void AmiAPI_SetTimeout(
+    struct AmiAPIContext *ctx,
+    unsigned int seconds)
+{
+    if (ctx && ctx->magic == AMIAPI_CONTEXT_MAGIC)
+        ctx->timeout_seconds = seconds;
+}
+
+unsigned int AmiAPI_Timeout(
+    const struct AmiAPIContext *ctx)
+{
+    if (!ctx || ctx->magic != AMIAPI_CONTEXT_MAGIC)
+        return 0;
+
+    return ctx->timeout_seconds;
+}
+
 enum AmiAPIError AmiAPI_LastError(const struct AmiAPIContext *ctx)
 { return (!ctx || ctx->magic != AMIAPI_CONTEXT_MAGIC) ? AMIAPI_ERR_INVALID_ARGUMENT : ctx->last_error; }
 void amiapi_set_error(struct AmiAPIContext *ctx, enum AmiAPIError e)

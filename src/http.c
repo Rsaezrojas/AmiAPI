@@ -900,6 +900,7 @@ static struct AmiAPIResponse *amiapi_get_once(
     transport.tls_ctx = NULL;
     transport.tls_ssl = NULL;
     transport.use_tls = 0;
+    transport.timeout_seconds = ctx->timeout_seconds;
 
     if (!api_request ||
         !ctx ||
