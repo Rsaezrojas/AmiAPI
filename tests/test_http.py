@@ -625,6 +625,218 @@ def test_https_streaming():
     print("HTTPS streaming response test: OK")
 
 
+DOWNLOAD_BODY = bytes(range(256)) + b"download\x00\xff"
+LARGE_DOWNLOAD_BODY = bytes(range(256)) * 2048
+
+
+class DownloadHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(DOWNLOAD_BODY)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path in ("/length", "/final"):
+            body = DOWNLOAD_BODY
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/large":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(LARGE_DOWNLOAD_BODY)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for offset in range(0, len(LARGE_DOWNLOAD_BODY), 4096):
+                self.wfile.write(LARGE_DOWNLOAD_BODY[offset:offset + 4096])
+        elif self.path == "/chunked":
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for part in (DOWNLOAD_BODY[:17], DOWNLOAD_BODY[17:200],
+                         DOWNLOAD_BODY[200:]):
+                self.wfile.write(f"{len(part):x}\r\n".encode())
+                self.wfile.write(part + b"\r\n")
+            self.wfile.write(b"0\r\nIgnored: trailer\r\n\r\n")
+        elif self.path == "/eof":
+            self.send_response(200)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(DOWNLOAD_BODY)
+        elif self.path == "/redirect":
+            body = b"redirect body must not be downloaded"
+            self.send_response(302)
+            self.send_header("Location", "/final")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/error":
+            body = b"not a successful download"
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/header":
+            if self.headers.get("X-Download-Token") != "allowed":
+                self.send_error(403)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(DOWNLOAD_BODY)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(DOWNLOAD_BODY)
+        elif self.path == "/slow":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(DOWNLOAD_BODY)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(DOWNLOAD_BODY[:8])
+            self.wfile.flush()
+            time.sleep(2)
+            try:
+                self.wfile.write(DOWNLOAD_BODY[8:])
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def run_download(method, url, destination, max_body=AMIAPI_DEFAULT_MAX_BODY_PY,
+                 timeout=5, headers=(), env=None):
+    command = [
+        "./build/downloadget", method, url, str(destination),
+        str(max_body), str(timeout),
+    ]
+    for name, value in headers:
+        command.extend((name, value))
+    return subprocess.run(
+        command, text=True, capture_output=True, timeout=15, env=env
+    )
+
+
+def assert_no_download_temporary(destination):
+    leftovers = list(destination.parent.glob(destination.name + ".amiapi.tmp.*"))
+    assert not leftovers, leftovers
+
+
+def test_file_downloads():
+    with tempfile.TemporaryDirectory(prefix="amiapi-download-") as tmp:
+        directory = Path(tmp)
+        with TestServer(("127.0.0.1", 0), DownloadHandler) as server:
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{port}"
+            try:
+                for endpoint in ("length", "chunked", "eof"):
+                    destination = directory / endpoint
+                    result = run_download("GET", base + "/" + endpoint, destination)
+                    assert result.returncode == 0, result.stdout + result.stderr
+                    assert destination.read_bytes() == DOWNLOAD_BODY
+                    assert_no_download_temporary(destination)
+
+                large = directory / "large"
+                result = run_download("GET", base + "/large", large,
+                                      max_body=len(LARGE_DOWNLOAD_BODY))
+                assert result.returncode == 0, result.stdout + result.stderr
+                assert large.read_bytes() == LARGE_DOWNLOAD_BODY
+                assert_no_download_temporary(large)
+
+                redirected = directory / "redirected"
+                result = run_download("GET", base + "/redirect", redirected)
+                assert result.returncode == 0, result.stdout + result.stderr
+                assert redirected.read_bytes() == DOWNLOAD_BODY
+                assert_no_download_temporary(redirected)
+
+                configured = directory / "configured"
+                result = run_download(
+                    "GET", base + "/header", configured,
+                    headers=(("X-Download-Token", "allowed"),),
+                )
+                assert result.returncode == 0, result.stdout + result.stderr
+                assert configured.read_bytes() == DOWNLOAD_BODY
+
+                convenience = directory / "convenience"
+                result = run_download("CONVENIENCE", base + "/length", convenience)
+                assert result.returncode == 0, result.stdout + result.stderr
+                assert convenience.read_bytes() == DOWNLOAD_BODY
+
+                for endpoint, max_body, timeout in (
+                    ("error", AMIAPI_DEFAULT_MAX_BODY_PY, 5),
+                    ("length", 8, 5),
+                    ("slow", AMIAPI_DEFAULT_MAX_BODY_PY, 1),
+                ):
+                    destination = directory / ("failed-" + endpoint)
+                    result = run_download("GET", base + "/" + endpoint,
+                                          destination, max_body, timeout)
+                    assert result.returncode == 20, result.stdout + result.stderr
+                    assert not destination.exists()
+                    assert_no_download_temporary(destination)
+
+                existing = directory / "existing"
+                existing.write_bytes(b"preserved")
+                result = run_download("GET", base + "/length", existing)
+                assert result.returncode == 20, result.stdout + result.stderr
+                assert existing.read_bytes() == b"preserved"
+                assert_no_download_temporary(existing)
+
+                missing_parent = directory / "missing" / "file"
+                result = run_download("GET", base + "/length", missing_parent)
+                assert result.returncode == 20, result.stdout + result.stderr
+                assert "error: 14" in result.stdout, result.stdout
+                assert not missing_parent.exists()
+
+                head = directory / "head"
+                result = run_download("HEAD", base + "/length", head)
+                assert result.returncode == 20, result.stdout + result.stderr
+                assert not head.exists()
+                assert_no_download_temporary(head)
+            finally:
+                server.shutdown()
+                thread.join()
+
+    print("Safe file download tests: OK")
+
+
+def test_https_file_download():
+    with tempfile.TemporaryDirectory(prefix="amiapi-https-download-") as tmp:
+        directory = Path(tmp)
+        ca_cert, server_cert, server_key = make_certificates(directory)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=server_cert, keyfile=server_key)
+        with TestServer(("127.0.0.1", 0), DownloadHandler) as server:
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            env = os.environ.copy()
+            env["SSL_CERT_FILE"] = str(ca_cert)
+            destination = directory / "https-download"
+            try:
+                result = run_download(
+                    "GET", f"https://localhost:{port}/chunked",
+                    destination, env=env,
+                )
+            finally:
+                server.shutdown()
+                thread.join()
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert destination.read_bytes() == DOWNLOAD_BODY
+        assert_no_download_temporary(destination)
+
+    print("HTTPS file download test: OK")
+
+
 class RedirectHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2262,6 +2474,8 @@ def main():
     test_https_chunked()
     test_streaming_responses()
     test_https_streaming()
+    test_file_downloads()
+    test_https_file_download()
     test_redirects()
     test_http_to_https_redirect()
 

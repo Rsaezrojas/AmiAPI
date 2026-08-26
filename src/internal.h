@@ -24,4 +24,6 @@ enum AmiAPIError amiapi_transport_send_all(struct AmiAPITransport *, const void 
 long amiapi_transport_receive(struct AmiAPITransport *, void *, size_t);
 void amiapi_transport_close(struct AmiAPITransport *);
 void amiapi_transport_platform_cleanup(void);
+int amiapi_file_publish(const char *, const char *);
+void amiapi_file_remove(const char *);
 #endif

@@ -48,11 +48,20 @@ enum AmiAPIError AmiAPI_RequestSetResponseCallback(
     AmiAPIBodyCallback,
     void *
 );
+enum AmiAPIError AmiAPI_RequestDownloadFile(
+    struct AmiAPIRequest *,
+    const char *
+);
 void AmiAPI_RequestClearHeaders(struct AmiAPIRequest *);
 struct AmiAPIResponse *AmiAPI_RequestExecute(struct AmiAPIRequest *);
 void AmiAPI_RequestDestroy(struct AmiAPIRequest *);
 
 struct AmiAPIResponse *AmiAPI_Get(struct AmiAPIContext *, const char *);
+enum AmiAPIError AmiAPI_DownloadFile(
+    struct AmiAPIContext *,
+    const char *,
+    const char *
+);
 void AmiAPI_FreeResponse(struct AmiAPIResponse *);
 int AmiAPI_Status(const struct AmiAPIResponse *);
 const unsigned char *AmiAPI_Body(const struct AmiAPIResponse *);

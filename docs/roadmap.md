@@ -48,11 +48,16 @@
 
 DNS resolver timeout remains controlled by the platform TCP/IP stack.
 
-## Next milestones
-
 ### Streaming and download-to-file
 
-Avoid buffering large API responses and downloads entirely in memory.
+- incremental decoded response-body callbacks
+- bounded-memory downloads using the shared HTTP body decoder
+- binary-safe Content-Length, chunked, EOF-framed, HTTP, and HTTPS downloads
+- sibling temporary files published only after successful 2xx completion
+- decoded maximum-body enforcement and cleanup on failure
+- conservative preservation of existing destination files on POSIX and AmigaOS
+
+## Next milestones
 
 ### SDK stabilization
 

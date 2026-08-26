@@ -31,6 +31,8 @@ A stock A1200 with Fast RAM is the reference performance class.
 - application/x-www-form-urlencoded helpers
 - JSON parsing and JSON HTTP helpers
 - bounded response buffering
+- incremental response-body callbacks
+- safe streaming downloads to files
 - configurable network timeout
 - POSIX backend for host-side development and testing
 - native AmigaOS bsdsocket.library/AmiSSL backend
@@ -61,15 +63,32 @@ TCP connection establishment. Resolver calls may therefore use the
 TCP/IP stack's own DNS timeout and are not bounded by
 AmiAPI_SetTimeout().
 
-## Memory
+## Response bodies and file downloads
 
-HTTP response bodies are currently buffered in memory and bounded by
-the context's maximum-body setting. The receive scratch buffer is
-heap-backed to remain safe with the small process stacks commonly used
-on classic AmigaOS.
+Responses are buffered by default. Applications can instead configure an
+`AmiAPIBodyCallback` to consume decoded body bytes incrementally, or download
+directly to a file:
 
-Streaming and download-to-file support are planned for a later
-milestone.
+    error = AmiAPI_RequestDownloadFile(request, "Work:response.bin");
+
+`AmiAPI_DownloadFile()` is the corresponding simple GET convenience helper.
+Downloads use the same Content-Length, chunked, EOF-framed, redirect, timeout,
+and TLS path as other requests. The whole file is never held in memory.
+
+Downloads are published only for a final 2xx HTTP response after the complete
+body has been received and the temporary file has closed successfully. AmiAPI
+writes a suffixed temporary file beside the destination, then renames it into
+place. Failures remove the temporary file. The configured maximum-body limit
+still applies to total decoded bytes.
+
+For portable safety, an existing destination is never replaced or unlinked;
+the download fails and preserves it. This conservative policy avoids relying
+on differing replacement semantics across POSIX and classic Amiga filesystems.
+Temporary-name creation uses portable C file operations, so applications
+should not concurrently download to the same destination path.
+
+The receive scratch buffer is heap-backed to remain safe with the small
+process stacks commonly used on classic AmigaOS.
 
 ## Building
 

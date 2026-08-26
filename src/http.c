@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,10 @@ struct AmiAPIResponse {
     size_t header_count;
     unsigned char *body;
     size_t body_size;
+};
+
+struct AmiAPIFileWriter {
+    FILE *file;
 };
 struct ParsedURL {
     char *host;
@@ -1858,6 +1863,81 @@ enum AmiAPIError AmiAPI_RequestSetResponseCallback(
     return AMIAPI_OK;
 }
 
+static enum AmiAPIError write_download_body(
+    const void *data,
+    size_t size,
+    void *userdata)
+{
+    struct AmiAPIFileWriter *writer =
+        (struct AmiAPIFileWriter *)userdata;
+
+    if (!writer || !writer->file || (!data && size != 0))
+        return AMIAPI_ERR_FILESYSTEM;
+
+    if (size != 0 && fwrite(data, 1, size, writer->file) != size)
+        return AMIAPI_ERR_FILESYSTEM;
+
+    return AMIAPI_OK;
+}
+
+static int path_is_absent(const char *path)
+{
+    FILE *file;
+
+    errno = 0;
+    file = fopen(path, "rb");
+    if (file) {
+        fclose(file);
+        return 0;
+    }
+
+    return errno == ENOENT;
+}
+
+static enum AmiAPIError open_download_temporary(
+    const char *path,
+    char **temporary_path,
+    FILE **file)
+{
+    size_t path_size;
+    char *candidate;
+    unsigned int suffix;
+
+    path_size = strlen(path);
+    if (path_size > (size_t)-1 - 32)
+        return AMIAPI_ERR_NO_MEMORY;
+
+    candidate = (char *)malloc(path_size + 32);
+    if (!candidate)
+        return AMIAPI_ERR_NO_MEMORY;
+
+    for (suffix = 0; suffix < 1000; ++suffix) {
+        snprintf(
+            candidate,
+            path_size + 32,
+            "%s.amiapi.tmp.%u",
+            path,
+            suffix
+        );
+
+        if (!path_is_absent(candidate))
+            continue;
+
+        errno = 0;
+        *file = fopen(candidate, "wb");
+        if (*file) {
+            *temporary_path = candidate;
+            return AMIAPI_OK;
+        }
+
+        free(candidate);
+        return AMIAPI_ERR_FILESYSTEM;
+    }
+
+    free(candidate);
+    return AMIAPI_ERR_FILESYSTEM;
+}
+
 void AmiAPI_RequestClearHeaders(
     struct AmiAPIRequest *request)
 {
@@ -2018,6 +2098,89 @@ struct AmiAPIResponse *AmiAPI_RequestExecute(
     }
 }
 
+enum AmiAPIError AmiAPI_RequestDownloadFile(
+    struct AmiAPIRequest *request,
+    const char *path)
+{
+    struct AmiAPIContext *ctx;
+    struct AmiAPIResponse *response;
+    struct AmiAPIFileWriter writer;
+    AmiAPIBodyCallback saved_callback;
+    void *saved_userdata;
+    char *temporary_path;
+    enum AmiAPIError err;
+
+    if (!request ||
+        !request->ctx ||
+        request->ctx->magic != AMIAPI_CONTEXT_MAGIC ||
+        !path ||
+        !*path)
+    {
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+    }
+
+    ctx = request->ctx;
+
+    /* A HEAD response has metadata but no downloadable representation. */
+    if (ascii_equal_ci(request->method, "HEAD")) {
+        amiapi_set_error(ctx, AMIAPI_ERR_INVALID_ARGUMENT);
+        return AMIAPI_ERR_INVALID_ARGUMENT;
+    }
+
+    /* Portable replacement is not guaranteed on classic Amiga filesystems. */
+    if (!path_is_absent(path)) {
+        amiapi_set_error(ctx, AMIAPI_ERR_FILESYSTEM);
+        return AMIAPI_ERR_FILESYSTEM;
+    }
+
+    temporary_path = NULL;
+    writer.file = NULL;
+    err = open_download_temporary(path, &temporary_path, &writer.file);
+    if (err != AMIAPI_OK) {
+        amiapi_set_error(ctx, err);
+        return err;
+    }
+
+    saved_callback = request->response_callback;
+    saved_userdata = request->response_userdata;
+    request->response_callback = write_download_body;
+    request->response_userdata = &writer;
+
+    response = AmiAPI_RequestExecute(request);
+
+    request->response_callback = saved_callback;
+    request->response_userdata = saved_userdata;
+
+    if (!response) {
+        err = AmiAPI_LastError(ctx);
+        fclose(writer.file);
+        amiapi_file_remove(temporary_path);
+        free(temporary_path);
+        amiapi_set_error(ctx, err);
+        return err;
+    }
+
+    if (fclose(writer.file) != 0)
+        err = AMIAPI_ERR_FILESYSTEM;
+    else if (response->status < 200 || response->status >= 300)
+        err = AMIAPI_ERR_HTTP_STATUS;
+    else if (!path_is_absent(path))
+        err = AMIAPI_ERR_FILESYSTEM;
+    else if (amiapi_file_publish(temporary_path, path) != 0)
+        err = AMIAPI_ERR_FILESYSTEM;
+    else
+        err = AMIAPI_OK;
+
+    AmiAPI_FreeResponse(response);
+
+    if (err != AMIAPI_OK)
+        amiapi_file_remove(temporary_path);
+
+    free(temporary_path);
+    amiapi_set_error(ctx, err);
+    return err;
+}
+
 struct AmiAPIResponse *AmiAPI_Get(
     struct AmiAPIContext *ctx,
     const char *url)
@@ -2039,6 +2202,23 @@ struct AmiAPIResponse *AmiAPI_Get(
     AmiAPI_RequestDestroy(request);
 
     return response;
+}
+
+enum AmiAPIError AmiAPI_DownloadFile(
+    struct AmiAPIContext *ctx,
+    const char *url,
+    const char *path)
+{
+    struct AmiAPIRequest *request;
+    enum AmiAPIError err;
+
+    request = AmiAPI_RequestCreate(ctx, "GET", url);
+    if (!request)
+        return AmiAPI_LastError(ctx);
+
+    err = AmiAPI_RequestDownloadFile(request, path);
+    AmiAPI_RequestDestroy(request);
+    return err;
 }
 
 void AmiAPI_FreeResponse(struct AmiAPIResponse *response)

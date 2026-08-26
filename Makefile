@@ -32,17 +32,21 @@ AUTHGET := $(BUILD)/authget
 BASICGET := $(BUILD)/basicget
 TIMEOUTGET := $(BUILD)/timeoutget
 STREAMGET := $(BUILD)/streamget
+DOWNLOADGET := $(BUILD)/downloadget
 
 ifeq ($(PLATFORM),posix)
 TRANSPORT_SRC := src/transport_posix.c
+FILESYSTEM_SRC := src/file_posix.c
 LDLIBS += -lssl -lcrypto
 else ifeq ($(PLATFORM),amiga)
 TRANSPORT_SRC := src/transport_amiga.c
+FILESYSTEM_SRC := src/file_amiga.c
 else
 $(error Unknown PLATFORM '$(PLATFORM)'; use posix or amiga)
 endif
 
 TRANSPORT_OBJ := $(BUILD)/transport.o
+FILESYSTEM_OBJ := $(BUILD)/file.o
 
 LIB_OBJS := \
 	$(BUILD)/context.o \
@@ -53,6 +57,7 @@ LIB_OBJS := \
 	$(BUILD)/url.o \
 	$(BUILD)/form.o \
 	$(BUILD)/auth.o \
+	$(FILESYSTEM_OBJ) \
 	$(TRANSPORT_OBJ)
 
 .PHONY: all clean test print-config
@@ -88,6 +93,9 @@ $(BUILD)/auth.o: src/auth.c include/amiapi/auth.h include/amiapi/amiapi.h | $(BU
 
 $(TRANSPORT_OBJ): $(TRANSPORT_SRC) src/internal.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $(TRANSPORT_SRC) -o $@
+
+$(FILESYSTEM_OBJ): $(FILESYSTEM_SRC) src/internal.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $(FILESYSTEM_SRC) -o $@
 
 $(LIB): $(LIB_OBJS)
 	$(AR) $(ARFLAGS) $@ $^
@@ -134,9 +142,12 @@ $(TIMEOUTGET): tests/timeoutget.c $(LIB)
 $(STREAMGET): tests/streamget.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+$(DOWNLOADGET): tests/downloadget.c $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 test: all
 ifeq ($(PLATFORM),posix)
-	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND) $(AUTHGET) $(BASICGET) $(TIMEOUTGET) $(STREAMGET)
+	$(MAKE) $(REQUESTGET) $(REQUESTSEND) $(TEST_JSON) $(JSONHTTP) $(JSONSEND) $(TEST_URL) $(TEST_FORM) $(FORMSEND) $(AUTHGET) $(BASICGET) $(TIMEOUTGET) $(STREAMGET) $(DOWNLOADGET)
 	$(HELLO)
 	$(PYTHON) tests/test_http.py
 	$(TEST_JSON)
